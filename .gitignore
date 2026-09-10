@@ -65,3 +65,6 @@ target/
 
 # MacOS DS_store
 .DS_Store
+
+# 实验脚本生成的图片等临时产物（脚本默认输出到其所在目录的 temp 子文件夹）
+scripts/ganlin/test_gnpy/temp/

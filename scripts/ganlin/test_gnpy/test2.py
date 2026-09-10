@@ -1,11 +1,13 @@
-"""在 Python 代码中手工构造单跨 C+L 链路，按 C96 / L96 满波加载，输出所有波长的性能。
+"""在 Python 代码中手工构造单跨 C+L 链路，按 C96 / L96 加载，输出所有波长的性能。
 
 对照 test.py：
     transmission_main_example() 用默认参数读取 gnpy/example-data/edfa_example_network.json，
     由 cli_examples 内部完成 autodesign 和传播（Site_A -> Span1(80km) -> Edfa1 -> Site_B）。
 
 test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 创建 Transceiver / Fiber / Edfa：
-- 频点取自 gnpy.bplab.utils.band_center_frequencies（C96 / L96 各 96 波，193.1 THz 锚点的 50 GHz 栅格）
+- 设备库来自同目录的 eqpt_config.json（含 Huawei 的 800G ZR+ TFLN BOL 模块性能），
+  用 gnpy.bplab.trx.load_equipment_with_module_power 加载，以支持模块的 tx_power（最大出光功率）
+- 频点取自 gnpy.bplab.utils.band_center_frequencies（按模块 min_spacing = 150 GHz 取 C96 / L96 栅格）
 - 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE / SNR_TRX，以及三者噪声功率求和得到的 SNR_total
 - 绘制光纤输入/输出功率谱
@@ -17,6 +19,7 @@ from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
 from numpy import concatenate
 
+from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import band_center_frequencies
 from gnpy.core.elements import Edfa, Fiber, Transceiver
 from gnpy.core.equipment import trx_mode_params
@@ -24,7 +27,6 @@ from gnpy.core.info import create_arbitrary_spectral_information
 from gnpy.core.parameters import SimParams, TransceiverRole
 from gnpy.core.science_utils import RamanSolver
 from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm
-from gnpy.tools.json_io import DEFAULT_EQPT_CONFIG, load_equipment
 
 # matplotlib 默认字体不含中文字形，必须指定中文字体，否则图中文字显示为方框
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DengXian']
@@ -32,14 +34,18 @@ rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DengXian']
 rcParams['axes.unicode_minus'] = False
 
 # ---------------------------------------------------------------- 设备库 / 模块参数
-equipment = load_equipment(Path(DEFAULT_EQPT_CONFIG))
+# 上游的 gnpy/example-data/eqpt_config.json 不动，模块性能写在同目录的本地副本里
+EQPT_CONFIG = Path(__file__).parent / 'eqpt_config.json'
+equipment = load_equipment_with_module_power(EQPT_CONFIG)
 si_default = equipment['SI']['default']
 
+trx_mode = trx_mode_params(equipment, 'Huawei', '800G ZR+ TFLN BOL')
 # SNR_TRX 是模块 B2B 无误码所需的 OSNR（设备库 Transceiver 模式的 OSNR 字段），
 # 与 TX_OSNR（发射机自身 OSNR）是两个不同的量
-trx_mode = trx_mode_params(equipment, 'vendorA_trx-type1', 'mode 1')
-snr_trx_db = trx_mode['OSNR']     # 模块 B2B 所需 OSNR（0.1 nm 参考），本案例 11 dB
-tx_osnr_db = trx_mode['tx_osnr']  # 发射机自身 OSNR，本案例 40 dB
+snr_trx_db = trx_mode['OSNR']     # 模块 B2B 所需 OSNR（0.1 nm 参考），本案例 24.5 dB
+tx_osnr_db = trx_mode['tx_osnr']  # 发射机自身 OSNR，本案例 41 dB
+# 模块最大出光功率 tx_power，作为每波道发射功率的默认值并作为上限
+launch_dbm = launch_power_dbm(trx_mode)
 
 # 开启 SRS：RamanParams.flag 默认 False，不打开则 Fiber.propagate 只做纯衰减
 SimParams.set_params({'raman_params': {'flag': True,
@@ -52,19 +58,21 @@ loss_coef = 0.2             # dB/km
 con_in, con_out = 0.5, 0.5  # 连接器损耗 dB
 span_loss_db = loss_coef * length_km + con_in + con_out  # 17 dB
 
-spacing = si_default.spacing  # 50 GHz
+spacing = trx_mode['min_spacing']  # 150 GHz
+baud_rate = trx_mode['baud_rate']  # 131.3 GBaud
+roll_off = trx_mode['roll_off']    # 0.05
 
-# ---------------------------------------------------------------- C96 / L96 满波频谱
-# L96 占用 186.275 ~ 191.075 THz → 96 个中心频点 186.3 ~ 191.05 THz
+# ---------------------------------------------------------------- C96 / L96 频谱（按模块栅格）
+# L96 占用 186.275 ~ 191.075 THz → 150 GHz 栅格下 32 个中心频点 186.35 ~ 191.0 THz
 l96_centers = band_center_frequencies('L96', spacing)
-# C96 占用 191.275 ~ 196.075 THz → 96 个中心频点 191.3 ~ 196.05 THz
+# C96 占用 191.275 ~ 196.075 THz → 150 GHz 栅格下 31 个中心频点 191.45 ~ 195.95 THz
 c96_centers = band_center_frequencies('C96', spacing)
-frequency = concatenate([l96_centers, c96_centers])  # 升序，共 192 波
+frequency = concatenate([l96_centers, c96_centers])  # 升序，共 63 波
 
 si = create_arbitrary_spectral_information(
-    frequency=frequency, slot_width=spacing, pch=dbm2watt(si_default.tx_power_dbm),
-    baud_rate=si_default.baud_rate, roll_off=si_default.roll_off, tx_osnr=tx_osnr_db,
-    tx_power=dbm2watt(si_default.tx_power_dbm), required_osnr_db_01nm=snr_trx_db)
+    frequency=frequency, slot_width=spacing, pch=dbm2watt(launch_dbm),
+    baud_rate=baud_rate, roll_off=roll_off, tx_osnr=tx_osnr_db,
+    tx_power=dbm2watt(launch_dbm), required_osnr_db_01nm=snr_trx_db)
 
 # 色散 / 有效面积 / PMD 系数取自设备库，只覆盖与具体链路相关的参数
 fiber_params = dict(equipment['Fiber']['SSMF'].__dict__)
@@ -88,12 +96,14 @@ edfa = Edfa(uid='Edfa1', type_variety='std_low_gain', params=edfa_params,
 rx = Transceiver(uid='Site_B', params=trx_params,
                  metadata={'location': {'city': 'Site B', 'region': '', 'latitude': 3, 'longitude': 0}})
 
+print(f'模块 {trx_mode["format"]}（{baud_rate * 1e-9:.1f} GBaud / roll_off {roll_off}），'
+      f'模块最大出光功率 tx_power = {launch_dbm:.1f} dBm/波')
 print(f'跨度损耗 {span_loss_db:.1f} dB，EDFA 增益 {edfa.operational.gain_target:.1f} dB，'
       f'放大频带 {edfa.params.f_min * 1e-12:.3f} ~ {edfa.params.f_max * 1e-12:.3f} THz')
 print(f'频谱：{si.number_of_channels} 波（L96 {len(l96_centers)} + C96 {len(c96_centers)}），'
       f'{si.frequency[0] * 1e-12:.3f} ~ {si.frequency[-1] * 1e-12:.3f} THz，'
-      f'{si_default.baud_rate * 1e-9:.0f} GBaud / {spacing * 1e-9:.0f} GHz，'
-      f'输入 {si_default.tx_power_dbm:.1f} dBm/波（共 {si.ptot_dbm:.2f} dBm）')
+      f'{baud_rate * 1e-9:.1f} GBaud / {spacing * 1e-9:.0f} GHz，'
+      f'每波道 {launch_dbm:.1f} dBm（共 {si.ptot_dbm:.2f} dBm）')
 
 # ---------------------------------------------------------------- 传播
 si = tx(si, role=TransceiverRole.EMITTER)
@@ -111,7 +121,7 @@ slices = {'L96': slice(0, len(l96_centers)), 'C96': slice(len(l96_centers), None
 
 # ---------------------------------------------------------------- 每波长的噪声受限 SNR
 # SNR_ASE 按含滚降的实际信号带宽 BW*(1+Rolloff) 计算；SNR_NLI / SNR_TRX / SNR_total 为绝对量
-bw_eff = si.baud_rate * (1 + si.roll_off)   # 实际信号带宽 [Hz]，本案例 32 GHz x 1.15 = 36.8 GHz
+bw_eff = si.baud_rate * (1 + si.roll_off)   # 实际信号带宽 [Hz]，本案例 131.3 GHz x 1.05 = 137.865 GHz
 p_ase = si.ase * (1 + si.roll_off)          # ASE 噪声功率折算到 bw_eff
 p_trx = si.signal / db2lin(snr_trx_db)      # 模块噪声功率（由 SNR_TRX 等效）
 snr_ase = lin2db(si.signal / p_ase)
@@ -150,14 +160,17 @@ print(f'C+L 合计（{snr_total.size} 波）SNR_total：平均 {snr_total.mean()
 # ---------------------------------------------------------------- 光纤输入/输出功率谱
 # 横坐标用波长（nm）：lambda = c / f
 wavelength_nm = freq2wavelength(srs.frequency) * 1e9
+# 图片默认保存到脚本所在目录的 temp 子文件夹（该目录已加入 .gitignore）
+output_dir = Path(__file__).parent / 'temp'
+output_dir.mkdir(parents=True, exist_ok=True)
 
 figure(figsize=(11, 5))
 plot(wavelength_nm, watt2dbm(srs.power_profile[:, 0]), label='光纤输入')
 plot(wavelength_nm, watt2dbm(srs.power_profile[:, -1]), label='光纤输出（含 SRS）')
 xlabel('波长 (nm)')
 ylabel('每波道功率 (dBm)')
-title(f'C96 + L96 满波 {len(frequency)} 波，80 km SSMF 光纤输入/输出功率谱')
+title(f'C96 + L96 共 {len(frequency)} 波，80 km SSMF 光纤输入/输出功率谱')
 grid(True)
 legend()
-savefig(Path(__file__).parent / 'spectrum_c96_l96.png', dpi=150)
+savefig(output_dir / 'spectrum_c96_l96.png', dpi=150)
 show()
