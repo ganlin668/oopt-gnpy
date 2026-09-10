@@ -14,10 +14,12 @@ BPLab 自建的频点工具函数（纯新增，不修改 gnpy 原有代码）�
 
 from numpy import arange, array, ceil, floor
 
-# DWDM 波段占用带宽边缘 [Hz]：C96 / L96 各为 96 x 50 GHz = 4.8 THz
+# DWDM 波段占用带宽边缘 [Hz]：C/L 96 波各为 96 x 50 GHz = 4.8 THz，C/L 120 波各为 120 x 50 GHz = 6 THz
 DWDM_BAND_RANGES = {
     'C96': (191.275e12, 196.075e12),
     'L96': (186.275e12, 191.075e12),
+    'C120': (190.675e12, 196.675e12),
+    'L120': (185.075e12, 191.075e12),
 }
 
 
@@ -57,7 +59,7 @@ def itu_grid_center_frequencies(f_min, f_max, spacing, anchor_frequency=193.1e12
 def band_center_frequencies(band_name, spacing=50e9):
     """Center frequencies of the channels of a predefined DWDM band
 
-    :param band_name Band name, one of the keys of DWDM_BAND_RANGES ('C96', 'L96') [str]
+    :param band_name Band name, one of the keys of DWDM_BAND_RANGES ('C96', 'L96', 'C120', 'L120') [str]
     :param spacing Grid/channel spacing [Hz]
     :return Sorted array of the channel center frequencies [Hz]
 
