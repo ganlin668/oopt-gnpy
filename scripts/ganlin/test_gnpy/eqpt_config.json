@@ -198,6 +198,41 @@
       "preamp_variety": "std_medium_gain",
       "booster_variety": "high_power",
       "allowed_for_design": false
+    },
+    {
+      "type_variety": "L96_SGA_21dBm",
+      "f_min": 186.275e12,
+      "f_max": 191.075e12,
+      "type_def": "variable_gain",
+      "gain_flatmax": 35,
+      "gain_min": 25,
+      "p_max": 21,
+      "nf_min": 5.5,
+      "nf_max": 7,
+      "out_voa_auto": false,
+      "allowed_for_design": false
+    },
+    {
+      "type_variety": "C96_SGA_22dBm",
+      "f_min": 191.275e12,
+      "f_max": 196.075e12,
+      "type_def": "variable_gain",
+      "gain_flatmax": 35,
+      "gain_min": 25,
+      "p_max": 22,
+      "nf_min": 5.5,
+      "nf_max": 7,
+      "out_voa_auto": false,
+      "allowed_for_design": false
+    },
+    {
+      "type_variety": "C96L96_SGA_multiband",
+      "type_def": "multi_band",
+      "amplifiers": [
+        "L96_SGA_21dBm",
+        "C96_SGA_22dBm"
+      ],
+      "allowed_for_design": false
     }
   ],
   "Fiber": [
