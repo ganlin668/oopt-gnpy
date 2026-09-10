@@ -151,6 +151,9 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     """
     raw = load_json(Path(filename))
     extracted = _extract_module_power(raw)
+    # YANG 模型不识别 bplab 扩展段 Passive（由 gnpy.bplab.passives.load_passive_library 单独解析），
+    # 与 tx_power 同一手法：先摘掉才能通过 libyang 校验
+    raw.pop('Passive', None)
     json_data = yang_to_legacy(raw)
     _inject_module_power(json_data, extracted)
     return _equipment_from_json(json_data, extra_configs)

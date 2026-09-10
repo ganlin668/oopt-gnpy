@@ -4,15 +4,20 @@
     transmission_main_example() 用默认参数读取 gnpy/example-data/edfa_example_network.json，
     由 cli_examples 内部完成 autodesign 和传播（Site_A -> Span1(80km) -> Edfa1 -> Site_B）。
 
-test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 创建 Transceiver / Fiber / Multiband_amplifier：
-- 设备库来自同目录的 eqpt_config.json（含 Huawei 的 800G ZR+ TFLN BOL 模块性能，以及
-  C96_SGA_22dBm / L96_SGA_21dBm 两款光放），用 gnpy.bplab.trx.load_equipment_with_module_power 加载，
+test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 逐个搭建完整光路：
+
+    Tx -> Mux -> VOA -> OA1 -> FIU -> Fiber -> FIU -> OA2 -> VOA -> Demux -> Rx
+
+- 设备库来自同目录的 eqpt_config.json，用 gnpy.bplab.trx.load_equipment_with_module_power 加载，
   以支持模块的 tx_power（最大出光功率）
-- 跨段后用 C/L 双波段光放（C96L96_SGA_multiband）：C96 波段输出总功率 22 dBm、L96 波段 21 dBm
+- Mux / Demux / VOA / FIU 只做衰减建模，插损按 C96 / L96 波段分别配置在设备库的 Passive 段；
+  因 gnpy 的 Fused 只支持标量插损，这里用 gnpy.bplab.passives.BandAttenuator
+- 两级 OA 都用 C96_SGA_22dBm / L96_SGA_21dBm（C/L 双波段），各自工作在额定总输出功率
+  22 / 21 dBm：增益取 p_max - 该波段输入总功率
 - 频点取自 gnpy.bplab.utils.band_center_frequencies（按模块 min_spacing = 150 GHz 取 C96 / L96 栅格）
 - 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE
-- 绘制光纤输入/输出功率谱
+- 绘制光纤输入/输出、OA2 输出、接收端的功率谱
 """
 
 from pathlib import Path
@@ -21,6 +26,7 @@ from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
 from numpy import concatenate
 
+from gnpy.bplab.passives import BandAttenuator, load_passive_library
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import band_center_frequencies
 from gnpy.core.elements import Fiber, Multiband_amplifier, Transceiver
@@ -78,69 +84,109 @@ fiber_params = dict(equipment['Fiber']['SSMF'].__dict__)
 fiber_params.update(length=length_km, length_units='km', loss_coef=loss_coef,
                     att_in=0, con_in=con_in, con_out=con_out, pmd_coef=3.0e-15)
 
-# ---------------------------------------------------------------- 跨段后 C/L 双波段光放
+# ---------------------------------------------------------------- 无源器件插损（按波段）
+# Mux / VOA / FIU / Demux 只做衰减建模，插损按 C96 / L96 分别配置在设备库的 Passive 段
+library = load_passive_library(EQPT_CONFIG)
+
+# ---------------------------------------------------------------- 两级 C/L 双波段光放
 # 设备库里定义了两款 SGA：C96_SGA_22dBm（输出总功率 22 dBm）与 L96_SGA_21dBm（21 dBm）。
 # gnpy 用 p_max 表示放大器的最大总输出功率（饱和门限，见 Edfa.interpol_params），
 # 因此把每个波段的增益设为 "p_max - 该波段输入总功率"，使放大器正好工作在额定输出总功率上。
-amp_l96_pout_dbm = equipment['Edfa']['L96_SGA_21dBm'].p_max   # 21 dBm
-amp_c96_pout_dbm = equipment['Edfa']['C96_SGA_22dBm'].p_max   # 22 dBm
+AMP_BANDS = (('C96', len(c96_centers), equipment['Edfa']['C96_SGA_22dBm'].p_max),
+             ('L96', len(l96_centers), equipment['Edfa']['L96_SGA_21dBm'].p_max))
+# 增益余量：实际输入功率会被 SRS 等效应拉偏（本例可达 0.9 dB），留出余量后由 p_max 饱和门限
+# 钳位，输出才严格等于额定总输出功率
+AMP_GAIN_MARGIN_DB = 2.0
 
-# 放大器输入总功率 = 每波道发射功率 + 10log10(波数) - 跨度损耗
-amp_l96_pin_dbm = launch_dbm + lin2db(len(l96_centers)) - span_loss_db
-amp_c96_pin_dbm = launch_dbm + lin2db(len(c96_centers)) - span_loss_db
+amp_gain = {}   # {(光放名, 波段): 增益 [dB]}
+for band, nch, p_max_dbm in AMP_BANDS:
+    # 第一级（发端 VOA 之后）输入总功率 = 每波道发射功率 + 10log10(波数) - Mux 插损 - VOA 插损
+    oa1_pin_dbm = launch_dbm + lin2db(nch) - library['Mux'].loss[band] - library['VOA'].loss[band]
+    # 第二级（光纤之后）输入总功率 = 第一级额定输出 - FIU1 - 跨度损耗 - FIU2
+    oa2_pin_dbm = p_max_dbm - library['FIU'].loss[band] - span_loss_db - library['FIU'].loss[band]
+    amp_gain[('OA1', band)] = p_max_dbm - oa1_pin_dbm + AMP_GAIN_MARGIN_DB
+    amp_gain[('OA2', band)] = p_max_dbm - oa2_pin_dbm + AMP_GAIN_MARGIN_DB
 
 trx_params = {'system_margin': si_default.sys_margins}
 
-# ---------------------------------------------------------------- 构造元素
+
+def build_multiband_amp(uid, latitude):
+    """搭建 C/L 双波段光放；amplifiers 顺序决定合波后的信道顺序，L96 在前以保证频谱升序"""
+    return Multiband_amplifier(
+        uid=uid, type_variety='C96L96_SGA_multiband',
+        params=dict(equipment['Edfa']['C96L96_SGA_multiband'].__dict__),
+        amplifiers=[
+            {'type_variety': 'L96_SGA_21dBm',
+             'params': dict(equipment['Edfa']['L96_SGA_21dBm'].__dict__),
+             'operational': {'gain_target': amp_gain[(uid, 'L96')],
+                             'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}},
+            {'type_variety': 'C96_SGA_22dBm',
+             'params': dict(equipment['Edfa']['C96_SGA_22dBm'].__dict__),
+             'operational': {'gain_target': amp_gain[(uid, 'C96')],
+                             'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}}],
+        metadata={'location': {'city': '', 'region': '', 'latitude': latitude, 'longitude': 0}})
+
+
+def build_passive(uid, variety, latitude):
+    """搭建纯衰减器件（Mux / VOA / FIU / Demux）"""
+    return BandAttenuator(uid=uid, params={'type_variety': variety, 'loss': library[variety].loss},
+                          metadata={'location': {'city': '', 'region': '', 'latitude': latitude,
+                                                 'longitude': 0}})
+
+
+# ---------------------------------------------------------------- 构造元素（Tx -> ... -> Rx）
 tx = Transceiver(uid='Site_A', params=trx_params,
                  metadata={'location': {'city': 'Site A', 'region': '', 'latitude': 0, 'longitude': 0}})
+mux = build_passive('Mux', 'Mux', 1)
+voa_tx = build_passive('VOA_Tx', 'VOA', 2)
+oa1 = build_multiband_amp('OA1', 3)
+fiu1 = build_passive('FIU1', 'FIU', 4)
 fiber = Fiber(uid='Span1', type_variety='SSMF', params=fiber_params,
-              metadata={'location': {'city': '', 'region': '', 'latitude': 1, 'longitude': 0}})
-# amplifiers 的顺序决定合波后的信道顺序，L96 放在前面以保证频谱仍按频率升序
-amp = Multiband_amplifier(
-    uid='Edfa1', type_variety='C96L96_SGA_multiband',
-    params=dict(equipment['Edfa']['C96L96_SGA_multiband'].__dict__),
-    amplifiers=[
-        {'type_variety': 'L96_SGA_21dBm',
-         'params': dict(equipment['Edfa']['L96_SGA_21dBm'].__dict__),
-         'operational': {'gain_target': amp_l96_pout_dbm - amp_l96_pin_dbm,
-                         'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}},
-        {'type_variety': 'C96_SGA_22dBm',
-         'params': dict(equipment['Edfa']['C96_SGA_22dBm'].__dict__),
-         'operational': {'gain_target': amp_c96_pout_dbm - amp_c96_pin_dbm,
-                         'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}}],
-    metadata={'location': {'city': '', 'region': '', 'latitude': 2, 'longitude': 0}})
+              metadata={'location': {'city': '', 'region': '', 'latitude': 5, 'longitude': 0}})
+fiu2 = build_passive('FIU2', 'FIU', 6)
+oa2 = build_multiband_amp('OA2', 7)
+voa_rx = build_passive('VOA_Rx', 'VOA', 8)
+demux = build_passive('Demux', 'Demux', 9)
 rx = Transceiver(uid='Site_B', params=trx_params,
-                 metadata={'location': {'city': 'Site B', 'region': '', 'latitude': 3, 'longitude': 0}})
+                 metadata={'location': {'city': 'Site B', 'region': '', 'latitude': 10, 'longitude': 0}})
 
 print(f'模块 {trx_mode["format"]}（{baud_rate * 1e-9:.1f} GBaud / roll_off {roll_off}），'
       f'模块最大出光功率 tx_power = {launch_dbm:.1f} dBm/波')
-print(f'跨度损耗 {span_loss_db:.1f} dB，{amp.params.type_variety} 输出总功率目标：'
-      f'L96 {amp_l96_pout_dbm:.0f} dBm（增益 {amp_l96_pout_dbm - amp_l96_pin_dbm:.2f} dB，'
-      f'输入 {amp_l96_pin_dbm:.2f} dBm）/ '
-      f'C96 {amp_c96_pout_dbm:.0f} dBm（增益 {amp_c96_pout_dbm - amp_c96_pin_dbm:.2f} dB，'
-      f'输入 {amp_c96_pin_dbm:.2f} dBm）')
+print(f'跨度损耗 {span_loss_db:.1f} dB；无源器件插损 [dB]：' + '，'.join(
+    f'{name} C96 {library[name].loss["C96"]:g}/L96 {library[name].loss["L96"]:g}'
+    for name in ('Mux', 'VOA', 'FIU', 'Demux')))
+print('两级光放（C96_SGA_22dBm / L96_SGA_21dBm）增益目标 [dB]：' + '，'.join(
+    f'{uid} C96 {amp_gain[(uid, "C96")]:.2f}/L96 {amp_gain[(uid, "L96")]:.2f}' for uid in ('OA1', 'OA2')))
 print(f'频谱：{si.number_of_channels} 波（L96 {len(l96_centers)} + C96 {len(c96_centers)}），'
       f'{si.frequency[0] * 1e-12:.3f} ~ {si.frequency[-1] * 1e-12:.3f} THz，'
       f'{baud_rate * 1e-9:.1f} GBaud / {spacing * 1e-9:.0f} GHz，'
       f'每波道 {launch_dbm:.1f} dBm（共 {si.ptot_dbm:.2f} dBm）')
 
-# ---------------------------------------------------------------- 传播
+# ---------------------------------------------------------------- 传播（按光路顺序）
 si = tx(si, role=TransceiverRole.EMITTER)
-# Fiber.propagate 内部会自己算一遍 SRS 但不落属性，这里单独求解一次，
-# 用于打印 SRS 转移量并画光纤输入/输出功率谱
+si = mux(si)
+si = voa_tx(si)
+si = oa1(si)
+si = fiu1(si)
+# SRS 求解必须用光纤输入谱（FIU1 之后）。Fiber.propagate 内部会自己算一遍 SRS 但不落属性，
+# 这里单独求解一次，用于打印 SRS 转移量并画光纤输入/输出功率谱
 srs = RamanSolver.calculate_stimulated_raman_scattering(si, fiber)           # 含 SRS
 srs_attenuation_only = RamanSolver.calculate_attenuation_profile(si, fiber)  # 仅纯衰减，作参照
 fiber.propagate(si)  # 手工建链时 ref_pch_in_dbm 为 None，故直接调用 propagate
-si = amp(si)         # C/L 分带放大后再合波
+si = fiu2(si)
+si = oa2(si)
+oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
+si = voa_rx(si)
+si = demux(si)
 si = rx(si, role=TransceiverRole.RECEIVER)
 
-assert si.number_of_channels == len(frequency), 'EDFA 频带把部分波长滤掉了，请检查 f_min / f_max'
+assert si.number_of_channels == len(frequency), '光放频带把部分波长滤掉了，请检查 f_min / f_max'
 
 print('\n光放工作点（输入/输出为该波段总功率，输出应等于该型号的 p_max）：')
-for band_name, sub_amp in amp.amplifiers.items():
-    print(f'  {band_name:>6} {sub_amp.params.type_variety}：增益 {sub_amp.effective_gain:.2f} dB，'
-          f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm')
+for uid, amplifier in (('OA1', oa1), ('OA2', oa2)):
+    for band_name, sub_amp in amplifier.amplifiers.items():
+        print(f'  {uid} {band_name:>6} {sub_amp.params.type_variety}：增益 {sub_amp.effective_gain:.2f} dB，'
+              f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm')
 
 slices = {'L96': slice(0, len(l96_centers)), 'C96': slice(len(l96_centers), None)}
 
@@ -166,20 +212,21 @@ print(f'  首波长 {si.frequency[0] * 1e-12:.4f} THz：{transfer_db[0]:+.3f} dB
 print(f'  末波长 {si.frequency[-1] * 1e-12:.4f} THz：{transfer_db[-1]:+.3f} dB')
 
 # ---------------------------------------------------------------- 功率谱
-# 横坐标用波长（nm）：lambda = c / f。三条曲线共用同一组频率（升序 63 波）
+# 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
 wavelength_nm = freq2wavelength(srs.frequency) * 1e9
 # 图片默认保存到脚本所在目录的 temp 子文件夹（该目录已加入 .gitignore）
 output_dir = Path(__file__).parent / 'temp'
 output_dir.mkdir(parents=True, exist_ok=True)
 
 figure(figsize=(11, 5))
-plot(wavelength_nm, watt2dbm(srs.power_profile[:, 0]), label='光纤输入（发端入纤）')
-plot(wavelength_nm, watt2dbm(srs.power_profile[:, -1]), label='光纤输出（光放输入，含 SRS）')
-plot(wavelength_nm, si.pch_dbm, label='光放输出（C96 22 dBm / L96 21 dBm 总功率）')
+plot(wavelength_nm, watt2dbm(srs.power_profile[:, 0]), label='光纤输入（OA1 输出经 FIU1）')
+plot(wavelength_nm, watt2dbm(srs.power_profile[:, -1]), label='光纤输出（OA2 输入，含 SRS）')
+plot(wavelength_nm, oa2_out_pch_dbm, label='OA2 输出（C96 22 dBm / L96 21 dBm 总功率）')
+plot(wavelength_nm, si.pch_dbm, label='接收端（VOA + Demux 后）')
 xlabel('波长 (nm)')
 ylabel('每波道功率 (dBm)')
-title(f'C96 + L96 共 {len(frequency)} 波：80 km SSMF + C/L 双波段光放功率谱')
+title(f'C96 + L96 共 {len(frequency)} 波：80 km SSMF + 两级 C/L 双波段光放功率谱')
 grid(True)
 legend()
 savefig(output_dir / 'spectrum_c96_l96.png', dpi=150)
-show()
+# show()
