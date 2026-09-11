@@ -163,22 +163,46 @@ print(f'频谱：{si.number_of_channels} 波（L96 {len(l96_centers)} + C96 {len
       f'每波道 {launch_dbm:.1f} dBm（共 {si.ptot_dbm:.2f} dBm）')
 
 # ---------------------------------------------------------------- 传播（按光路顺序）
-si = tx(si, role=TransceiverRole.EMITTER)
-si = mux(si)
-si = voa_tx(si)
-si = oa1(si)
-si = fiu1(si)
-# SRS 求解必须用光纤输入谱（FIU1 之后）。Fiber.propagate 内部会自己算一遍 SRS 但不落属性，
-# 这里单独求解一次，用于打印 SRS 转移量并画光纤输入/输出功率谱
-srs = RamanSolver.calculate_stimulated_raman_scattering(si, fiber)           # 含 SRS
-srs_attenuation_only = RamanSolver.calculate_attenuation_profile(si, fiber)  # 仅纯衰减，作参照
-fiber.propagate(si)  # 手工建链时 ref_pch_in_dbm 为 None，故直接调用 propagate
-si = fiu2(si)
-si = oa2(si)
-oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
-si = voa_rx(si)
-si = demux(si)
-si = rx(si, role=TransceiverRole.RECEIVER)
+# Fiber.propagate 内部会自己算一遍 SRS 但不落属性，这里单独求解一次，
+# 用于打印 SRS 转移量并画光纤输入/输出功率谱。必须在光纤传播前、用光纤输入谱求解
+srs_holder = {}
+
+
+def propagate_fiber(si):
+    """SRS 单独求解 + 光纤传播；手工建链时 ref_pch_in_dbm 为 None，故直接调用 propagate"""
+    srs_holder['srs'] = RamanSolver.calculate_stimulated_raman_scattering(si, fiber)         # 含 SRS
+    srs_holder['attenuation_only'] = RamanSolver.calculate_attenuation_profile(si, fiber)    # 仅纯衰减，作参照
+    fiber.propagate(si)
+    return si
+
+
+# 光路：(器件名, 类型, 传播函数)。元组顺序即器件连接顺序，传播与打印共用这一份定义
+CHAIN = (
+    ('Site_A', 'Transceiver', lambda si: tx(si, role=TransceiverRole.EMITTER)),
+    ('Mux', 'BandAttenuator', mux),
+    ('VOA_Tx', 'BandAttenuator', voa_tx),
+    ('OA1', 'Multiband_amplifier', oa1),
+    ('FIU1', 'BandAttenuator', fiu1),
+    ('Span1', 'Fiber', propagate_fiber),
+    ('FIU2', 'BandAttenuator', fiu2),
+    ('OA2', 'Multiband_amplifier', oa2),
+    ('VOA_Rx', 'BandAttenuator', voa_rx),
+    ('Demux', 'BandAttenuator', demux),
+    ('Site_B', 'Transceiver', lambda si: rx(si, role=TransceiverRole.RECEIVER)),
+)
+
+# 逐器件传播，同时记录每个器件的输入/输出总功率
+device_power = []   # [(器件名, 类型, 输入总功率 dBm, 输出总功率 dBm)]
+oa2_out_pch_dbm = None
+for uid, dev_type, apply in CHAIN:
+    pin_dbm = si.ptot_dbm
+    si = apply(si)
+    device_power.append((uid, dev_type, pin_dbm, si.ptot_dbm))
+    if uid == 'OA2':
+        oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
+
+srs = srs_holder['srs']
+srs_attenuation_only = srs_holder['attenuation_only']
 
 assert si.number_of_channels == len(frequency), '光放频带把部分波长滤掉了，请检查 f_min / f_max'
 
@@ -210,6 +234,15 @@ transfer_db = lin2db(srs.power_profile[:, -1]) - lin2db(srs_attenuation_only.pow
 print('\nSRS 转移量（有 SRS 相对纯衰减的输出功率变化）：')
 print(f'  首波长 {si.frequency[0] * 1e-12:.4f} THz：{transfer_db[0]:+.3f} dB')
 print(f'  末波长 {si.frequency[-1] * 1e-12:.4f} THz：{transfer_db[-1]:+.3f} dB')
+
+# ---------------------------------------------------------------- 器件链路汇总（最终输出）
+print('\n器件连接顺序（Tx -> Rx）：')
+print('  ' + ' -> '.join(uid for uid, _, _ in CHAIN))
+
+print('\n各器件输入/输出总功率（C96 + L96 全谱，含噪声）：')
+print(f'{"器件":<8}{"类型":<24}{"输入(dBm)":>10}{"输出(dBm)":>10}{"增减(dB)":>10}')
+for uid, dev_type, pin_dbm, pout_dbm in device_power:
+    print(f'{uid:<8}{dev_type:<24}{pin_dbm:>10.2f}{pout_dbm:>10.2f}{pout_dbm - pin_dbm:>10.2f}')
 
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
