@@ -24,7 +24,7 @@ from pathlib import Path
 
 from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
-from numpy import concatenate, inf, isfinite
+from numpy import concatenate, errstate, isfinite
 from rich.console import Console
 from rich.table import Table
 
@@ -203,17 +203,19 @@ def band_power_dbm(si):
 
 
 def band_osnr_db(si):
-    """按波段分别统计 OSNR [dB]：累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz
+    """按波段分别统计 OSNR 的（最差, 平均, 最好）[dB]，统计对象是波段内各波长的 OSNR
 
+    单波长 OSNR = 累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz。
     手工建链时 Transceiver(EMITTER) 不往光谱里注入 ASE（上游只在收端 update_snr 里合并
     tx_osnr），因此这里把 tx_osnr 一并计入，否则第一级光放之前的 OSNR 恒为无穷大。
     """
     ref_db = lin2db(12.5e9 / baud_rate)
     osnr = {}
-    for band, sl in slices.items():
-        ase = sum(si.ase[sl])
-        raw_db = lin2db(sum(si.signal[sl]) / ase) - ref_db if ase > 0 else inf
-        osnr[band] = -lin2db(db2lin(-raw_db) + db2lin(-tx_osnr_db))
+    with errstate(divide='ignore'):     # 无 ASE 时 signal / ase 为 inf，与 tx_osnr 合并后仍为有限值
+        for band, sl in slices.items():
+            raw_db = lin2db(si.signal[sl] / si.ase[sl]) - ref_db
+            values = -lin2db(db2lin(-raw_db) + db2lin(-tx_osnr_db))
+            osnr[band] = (values.min(), values.mean(), values.max())
     return osnr
 
 
@@ -268,36 +270,54 @@ print('  ' + ' -> '.join(uid for uid, _, _ in CHAIN))
 # rich 表格按显示宽度（中文字符占 2 列）对齐，避免手工 format 的对齐偏差；
 # 显式指定宽度，否则输出重定向/管道时 rich 按 80 列压缩表格，把列内容截断
 console = Console(width=140)
+BANDS = ('C96', 'L96')
 
 
 def fmt(value):
-    """非有限值（如无 ASE 时的无穷大 OSNR）统一显示为 '-'"""
+    """非有限值统一显示为 '-'"""
     return f'{value:.2f}' if isfinite(value) else '-'
 
 
-def print_device_table(title, unit, devices):
-    """按 C96 / L96 同表并列，逐器件打印输入/输出/增减（增减 = 输出 - 输入）"""
+def fmt_osnr(stats):
+    """波段内各波长 OSNR 的统计值：最差 / 平均 / 最好"""
+    return ' / '.join(fmt(value) for value in stats)
+
+
+def print_device_table(title, headers, devices):
+    """devices: [(器件, 类型, [各列文本])]，列顺序与 headers 一致"""
     print(f'\n{title}')
     table = Table(header_style='bold', pad_edge=False)
     table.add_column('器件', no_wrap=True)
     table.add_column('类型', no_wrap=True)
-    for band in ('C96', 'L96'):
-        for item, item_unit in (('输入', unit), ('输出', unit), ('增减', 'dB')):
-            table.add_column(f'{band} {item}({item_unit})', justify='right', no_wrap=True)
-    for uid, dev_type, value_in, value_out in devices:
-        row = [uid, dev_type]
-        for band in ('C96', 'L96'):
-            step = value_out[band] - value_in[band]
-            row += [fmt(value_in[band]), fmt(value_out[band]), fmt(step)]
-        table.add_row(*row)
+    for header in headers:
+        table.add_column(header, justify='right', no_wrap=True)
+    for uid, dev_type, cells in devices:
+        table.add_row(uid, dev_type, *cells)
     console.print(table)
 
 
+power_rows = []
+for uid, dev_type, pin_band, pout_band in device_power:
+    cells = []
+    for band in BANDS:
+        cells += [fmt(pin_band[band]), fmt(pout_band[band]),
+                  fmt(pout_band[band] - pin_band[band])]
+    power_rows.append((uid, dev_type, cells))
 print_device_table('各器件输入/输出总功率（C96 / L96 同表并列，含噪声；增减 = 输出 - 输入）',
-                   'dBm', device_power)
-print_device_table(f'各器件 OSNR（仅计 ASE，含发射机 tx_osnr {tx_osnr_db:.0f} dB，'
-                   f'折算到 0.1 nm / 12.5 GHz；增减 = 输出 - 输入）',
-                   'dB', device_osnr)
+                   [f'{band} {item}({unit})' for band in BANDS
+                    for item, unit in (('输入', 'dBm'), ('输出', 'dBm'), ('增减', 'dB'))],
+                   power_rows)
+
+osnr_rows = []
+for uid, dev_type, osnr_in_band, osnr_out_band in device_osnr:
+    cells = []
+    for band in BANDS:
+        cells += [fmt_osnr(osnr_in_band[band]), fmt_osnr(osnr_out_band[band])]
+    osnr_rows.append((uid, dev_type, cells))
+print_device_table(f'各器件 OSNR（单元格式为 最差 / 平均 / 最好；仅计 ASE，含发射机 tx_osnr {tx_osnr_db:.0f} dB，'
+                   f'折算到 0.1 nm / 12.5 GHz）',
+                   [f'{band} {side}(dB)' for band in BANDS for side in ('输入', '输出')],
+                   osnr_rows)
 
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
