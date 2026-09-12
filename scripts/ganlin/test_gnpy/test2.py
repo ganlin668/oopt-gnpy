@@ -25,6 +25,8 @@ from pathlib import Path
 from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
 from numpy import concatenate
+from rich.console import Console
+from rich.table import Table
 
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
@@ -191,13 +193,22 @@ CHAIN = (
     ('Site_B', 'Transceiver', lambda si: rx(si, role=TransceiverRole.RECEIVER)),
 )
 
-# 逐器件传播，同时记录每个器件的输入/输出总功率
-device_power = []   # [(器件名, 类型, 输入总功率 dBm, 输出总功率 dBm)]
+# 波段划分：frequency 为 [L96..., C96...] 升序拼接
+slices = {'L96': slice(0, len(l96_centers)), 'C96': slice(len(l96_centers), None)}
+
+
+def band_power_dbm(si):
+    """按波段分别统计总功率 [dBm]"""
+    return {band: watt2dbm(sum(si.pch[sl])) for band, sl in slices.items()}
+
+
+# 逐器件传播，同时记录每个器件分波段的输入/输出总功率
+device_power = []   # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
 oa2_out_pch_dbm = None
 for uid, dev_type, apply in CHAIN:
-    pin_dbm = si.ptot_dbm
+    pin_band = band_power_dbm(si)
     si = apply(si)
-    device_power.append((uid, dev_type, pin_dbm, si.ptot_dbm))
+    device_power.append((uid, dev_type, pin_band, band_power_dbm(si)))
     if uid == 'OA2':
         oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
 
@@ -211,8 +222,6 @@ for uid, amplifier in (('OA1', oa1), ('OA2', oa2)):
     for band_name, sub_amp in amplifier.amplifiers.items():
         print(f'  {uid} {band_name:>6} {sub_amp.params.type_variety}：增益 {sub_amp.effective_gain:.2f} dB，'
               f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm')
-
-slices = {'L96': slice(0, len(l96_centers)), 'C96': slice(len(l96_centers), None)}
 
 # ---------------------------------------------------------------- 每波长的噪声受限 SNR
 # SNR_ASE 按含滚降的实际信号带宽 BW*(1+Rolloff) 计算；SNR_NLI 为绝对量
@@ -239,10 +248,24 @@ print(f'  末波长 {si.frequency[-1] * 1e-12:.4f} THz：{transfer_db[-1]:+.3f} 
 print('\n器件连接顺序（Tx -> Rx）：')
 print('  ' + ' -> '.join(uid for uid, _, _ in CHAIN))
 
-print('\n各器件输入/输出总功率（C96 + L96 全谱，含噪声）：')
-print(f'{"器件":<8}{"类型":<24}{"输入(dBm)":>10}{"输出(dBm)":>10}{"增减(dB)":>10}')
-for uid, dev_type, pin_dbm, pout_dbm in device_power:
-    print(f'{uid:<8}{dev_type:<24}{pin_dbm:>10.2f}{pout_dbm:>10.2f}{pout_dbm - pin_dbm:>10.2f}')
+# rich 表格按显示宽度（中文字符占 2 列）对齐，避免手工 format 的对齐偏差；
+# 显式指定宽度，否则输出重定向/管道时 rich 按 80 列压缩表格，把列内容截断
+console = Console(width=140)
+
+print('\n各器件输入/输出总功率（C96 / L96 同表并列，含噪声；增减 = 输出 - 输入）：')
+table = Table(header_style='bold', pad_edge=False)
+table.add_column('器件', no_wrap=True)
+table.add_column('类型', no_wrap=True)
+for band in ('C96', 'L96'):
+    for item, unit in (('输入', 'dBm'), ('输出', 'dBm'), ('增减', 'dB')):
+        table.add_column(f'{band} {item}({unit})', justify='right', no_wrap=True)
+for uid, dev_type, pin_band, pout_band in device_power:
+    row = [uid, dev_type]
+    for band in ('C96', 'L96'):
+        row += [f'{pin_band[band]:.2f}', f'{pout_band[band]:.2f}',
+                f'{pout_band[band] - pin_band[band]:.2f}']
+    table.add_row(*row)
+console.print(table)
 
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
