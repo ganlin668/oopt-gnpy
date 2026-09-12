@@ -24,7 +24,7 @@ from pathlib import Path
 
 from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
-from numpy import concatenate
+from numpy import concatenate, inf, isfinite
 from rich.console import Console
 from rich.table import Table
 
@@ -36,7 +36,7 @@ from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
 from gnpy.core.parameters import SimParams, TransceiverRole
 from gnpy.core.science_utils import RamanSolver
-from gnpy.core.utils import dbm2watt, freq2wavelength, lin2db, watt2dbm
+from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm
 
 # matplotlib 默认字体不含中文字形，必须指定中文字体，否则图中文字显示为方框
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DengXian']
@@ -202,13 +202,30 @@ def band_power_dbm(si):
     return {band: watt2dbm(sum(si.pch[sl])) for band, sl in slices.items()}
 
 
-# 逐器件传播，同时记录每个器件分波段的输入/输出总功率
+def band_osnr_db(si):
+    """按波段分别统计 OSNR [dB]：累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz
+
+    手工建链时 Transceiver(EMITTER) 不往光谱里注入 ASE（上游只在收端 update_snr 里合并
+    tx_osnr），因此这里把 tx_osnr 一并计入，否则第一级光放之前的 OSNR 恒为无穷大。
+    """
+    ref_db = lin2db(12.5e9 / baud_rate)
+    osnr = {}
+    for band, sl in slices.items():
+        ase = sum(si.ase[sl])
+        raw_db = lin2db(sum(si.signal[sl]) / ase) - ref_db if ase > 0 else inf
+        osnr[band] = -lin2db(db2lin(-raw_db) + db2lin(-tx_osnr_db))
+    return osnr
+
+
+# 逐器件传播，同时记录每个器件分波段的输入/输出总功率和 OSNR
 device_power = []   # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
+device_osnr = []    # [(器件名, 类型, {波段: 输入 dB}, {波段: 输出 dB})]
 oa2_out_pch_dbm = None
 for uid, dev_type, apply in CHAIN:
-    pin_band = band_power_dbm(si)
+    pin_band, osnr_in_band = band_power_dbm(si), band_osnr_db(si)
     si = apply(si)
     device_power.append((uid, dev_type, pin_band, band_power_dbm(si)))
+    device_osnr.append((uid, dev_type, osnr_in_band, band_osnr_db(si)))
     if uid == 'OA2':
         oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
 
@@ -252,20 +269,35 @@ print('  ' + ' -> '.join(uid for uid, _, _ in CHAIN))
 # 显式指定宽度，否则输出重定向/管道时 rich 按 80 列压缩表格，把列内容截断
 console = Console(width=140)
 
-print('\n各器件输入/输出总功率（C96 / L96 同表并列，含噪声；增减 = 输出 - 输入）：')
-table = Table(header_style='bold', pad_edge=False)
-table.add_column('器件', no_wrap=True)
-table.add_column('类型', no_wrap=True)
-for band in ('C96', 'L96'):
-    for item, unit in (('输入', 'dBm'), ('输出', 'dBm'), ('增减', 'dB')):
-        table.add_column(f'{band} {item}({unit})', justify='right', no_wrap=True)
-for uid, dev_type, pin_band, pout_band in device_power:
-    row = [uid, dev_type]
+
+def fmt(value):
+    """非有限值（如无 ASE 时的无穷大 OSNR）统一显示为 '-'"""
+    return f'{value:.2f}' if isfinite(value) else '-'
+
+
+def print_device_table(title, unit, devices):
+    """按 C96 / L96 同表并列，逐器件打印输入/输出/增减（增减 = 输出 - 输入）"""
+    print(f'\n{title}')
+    table = Table(header_style='bold', pad_edge=False)
+    table.add_column('器件', no_wrap=True)
+    table.add_column('类型', no_wrap=True)
     for band in ('C96', 'L96'):
-        row += [f'{pin_band[band]:.2f}', f'{pout_band[band]:.2f}',
-                f'{pout_band[band] - pin_band[band]:.2f}']
-    table.add_row(*row)
-console.print(table)
+        for item, item_unit in (('输入', unit), ('输出', unit), ('增减', 'dB')):
+            table.add_column(f'{band} {item}({item_unit})', justify='right', no_wrap=True)
+    for uid, dev_type, value_in, value_out in devices:
+        row = [uid, dev_type]
+        for band in ('C96', 'L96'):
+            step = value_out[band] - value_in[band]
+            row += [fmt(value_in[band]), fmt(value_out[band]), fmt(step)]
+        table.add_row(*row)
+    console.print(table)
+
+
+print_device_table('各器件输入/输出总功率（C96 / L96 同表并列，含噪声；增减 = 输出 - 输入）',
+                   'dBm', device_power)
+print_device_table(f'各器件 OSNR（仅计 ASE，含发射机 tx_osnr {tx_osnr_db:.0f} dB，'
+                   f'折算到 0.1 nm / 12.5 GHz；增减 = 输出 - 输入）',
+                   'dB', device_osnr)
 
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
