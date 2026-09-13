@@ -19,7 +19,7 @@ from gnpy.bplab.edfa import (BPLAB_EXTRA_CONFIGS, LINEAR_DGT_CONFIG, LINEAR_DGT_
                              extract_nf_curves, parse_nf_curve, restore_gain_range,
                              stub_gain_range_for_curves)
 from gnpy.bplab.trx import load_equipment_with_module_power
-from gnpy.bplab.utils import band_center_frequencies
+from gnpy.bplab.utils import DWDM_BAND_RANGES, band_center_frequencies, band_filling_center_frequencies
 from gnpy.core.elements import Edfa
 from gnpy.core.exceptions import EquipmentConfigError
 from gnpy.core.info import create_arbitrary_spectral_information
@@ -133,6 +133,51 @@ def test_gain_profile_is_strictly_linear_with_tilt(equipment):
     assert max(abs(residual)) < 1e-9
     expected = 2.0 * (amp.channel_freq[-1] - amp.channel_freq[0]) / (amp.params.f_max - amp.params.f_min)
     assert amp.gprofile[-1] - amp.gprofile[0] == pytest.approx(expected, rel=1e-6)
+
+
+def make_low_power_si(n_channels=4, pch_dbm=-25):
+    """低功率入纤：p_max - pin 足够大，增益不受饱和门限限制，便于单独验证规范钳制"""
+    frequency = band_filling_center_frequencies(*DWDM_BAND_RANGES['C96'], SPACING)[:n_channels]
+    return create_arbitrary_spectral_information(
+        frequency=frequency, pch=dbm2watt(pch_dbm), baud_rate=131.3e9, tx_osnr=41,
+        slot_width=SPACING, roll_off=0.05, tx_power=dbm2watt(pch_dbm))
+
+
+def test_gain_above_curve_range_is_clamped_to_table_max(equipment, caplog):
+    """要求增益高于增益-NF 表上限：增益被钳到表上限（而不是按超规格运行）"""
+    gains, nfs = table_of(C96_VARIETY, equipment)
+    amp = make_amp(C96_VARIETY, gains[-1] + 2, equipment)
+
+    with caplog.at_level('WARNING'):
+        amp.interpol_params(make_low_power_si())
+
+    assert amp.effective_gain == gains[-1]
+    assert 'clamped' in caplog.text
+    assert_allclose(amp.nf.mean(), nfs[-1], atol=1e-9)
+
+
+def test_gain_below_curve_range_is_clamped_to_table_min(equipment, caplog):
+    """要求增益低于增益-NF 表下限：增益被钳到表下限"""
+    gains, nfs = table_of(C96_VARIETY, equipment)
+    amp = make_amp(C96_VARIETY, gains[0] - 2, equipment)
+
+    with caplog.at_level('WARNING'):
+        amp.interpol_params(make_low_power_si())
+
+    assert amp.effective_gain == gains[0]
+    assert 'clamped' in caplog.text
+    assert_allclose(amp.nf.mean(), nfs[0], atol=1e-9)
+
+
+def test_gain_within_curve_range_is_not_clamped(equipment, caplog):
+    """增益在表范围内：不钳制、不告警"""
+    amp = make_amp(C96_VARIETY, 20.0, equipment)
+
+    with caplog.at_level('WARNING'):
+        amp.interpol_params(make_low_power_si())
+
+    assert amp.effective_gain == 20.0
+    assert 'clamped' not in caplog.text
 
 
 def test_stub_gain_range_only_touches_unfittable_entries_with_curve():

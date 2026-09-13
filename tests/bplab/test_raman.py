@@ -15,7 +15,8 @@ from numpy import array, asarray, exp, sqrt
 from numpy.testing import assert_allclose
 from scipy.constants import c
 
-from gnpy.bplab.raman import (RAMAN_GAIN_KEY, RamanParams, RamanSolver, SrsFiber, _get_gR_dat, raman_gain_table)
+from gnpy.bplab.raman import (DEFAULT_GR_PEAK, DEFAULT_RAMAN_NS, DEFAULT_RAMAN_REFERENCE_WAVELENGTH, RAMAN_GAIN_KEY,
+                             RamanParams, RamanSolver, SrsFiber, _get_gR_dat, raman_gain_table)
 from gnpy.bplab.trx import load_equipment_with_module_power
 from gnpy.bplab.utils import DWDM_BAND_RANGES, band_filling_center_frequencies
 from gnpy.core.elements import Fiber
@@ -25,6 +26,7 @@ from gnpy.core.parameters import DEFAULT_RAMAN_COEFFICIENT
 from gnpy.core.science_utils import RamanSolver as UpstreamRamanSolver
 from gnpy.core.science_utils import StimulatedRamanScattering
 from gnpy.core.utils import dbm2watt, lin2db
+from gnpy.tools.json_io import load_json
 
 SPACING = 150e9
 EQPT_CONFIG = Path(__file__).parents[2] / 'scripts' / 'ganlin' / 'test_gnpy' / 'eqpt_config.json'
@@ -177,17 +179,19 @@ def test_srs_fiber_flag_false_matches_upstream_fiber(equipment):
 
 def test_loader_extracts_and_attaches_raman_gain(equipment):
     """设备库里的 raman_gain 段（YANG 不接受）能被加载器摘出并回填"""
-    assert getattr(equipment['Fiber'][FIBER_VARIETY], RAMAN_GAIN_KEY) == {
-        'gR_peak': 0.38e-3, 'reference_wavelength': 1480e-9, 'ns': 2.313}
+    raw = load_json(EQPT_CONFIG)
+    from_json = next(entry[RAMAN_GAIN_KEY] for entry in raw['Fiber'] if entry['type_variety'] == FIBER_VARIETY)
+    assert getattr(equipment['Fiber'][FIBER_VARIETY], RAMAN_GAIN_KEY) == from_json
 
 
 def test_srs_fiber_reads_raman_params_from_equipment(equipment):
     """SrsFiber 从设备库条目取拉曼参数，且不把该扩展字段留给 FiberParams"""
+    settings = getattr(equipment['Fiber'][FIBER_VARIETY], RAMAN_GAIN_KEY)
     fiber = make_fiber(equipment)
-    assert fiber.raman_params.gR_peak == 0.38e-3
-    assert fiber.raman_params.reference_wavelength == 1480e-9
-    assert fiber.raman_params.ns == 2.313
-    assert_allclose(fiber.raman_params.reference_frequency, c / 1480e-9)
+    assert fiber.raman_params.gR_peak == settings['gR_peak']
+    assert fiber.raman_params.reference_wavelength == settings['reference_wavelength']
+    assert fiber.raman_params.ns == settings['ns']
+    assert_allclose(fiber.raman_params.reference_frequency, c / settings['reference_wavelength'])
     assert not hasattr(fiber.params, RAMAN_GAIN_KEY)
 
 
@@ -198,9 +202,9 @@ def test_srs_fiber_falls_back_to_default_raman_params(equipment):
     params.update(length=LENGTH_KM, length_units='km', loss_coef=LOSS_COEF,
                   att_in=0, con_in=0, con_out=CON_OUT_DB)
     fiber = SrsFiber(uid='Span1', type_variety=FIBER_VARIETY, params=params, metadata=LOCATION)
-    assert fiber.raman_params.gR_peak == 0.38e-3
-    assert fiber.raman_params.reference_wavelength == 1480e-9
-    assert fiber.raman_params.ns == 2.313
+    assert fiber.raman_params.gR_peak == DEFAULT_GR_PEAK
+    assert fiber.raman_params.reference_wavelength == DEFAULT_RAMAN_REFERENCE_WAVELENGTH
+    assert fiber.raman_params.ns == DEFAULT_RAMAN_NS
 
 
 def test_lumped_losses_are_rejected(equipment):

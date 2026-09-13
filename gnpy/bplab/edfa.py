@@ -202,6 +202,9 @@ class GainNfEdfa(Edfa):
     ``params`` 里带 :data:`NF_CURVE_KEY` 时按表线性插值（超出表格范围时钳位到端点值），
     不带时完全走上游的 NF 模型。
 
+    增益-NF 表的增益范围就是该型号的增益规格：工作增益要求超出该范围时，先把增益钳制到
+    表的上下限再计算（既不查表外推、也不按超规格运行），此时输出功率会低于额定 ``p_max``。
+
     :param params: 同 :class:`gnpy.core.elements.Edfa`，可额外带增益-NF 表
     """
 
@@ -210,6 +213,24 @@ class GainNfEdfa(Edfa):
         curve = parse_nf_curve((params or {}).get(NF_CURVE_KEY))
         super().__init__(*args, params=params, **kwargs)
         self.nf_curve = curve
+
+    def interpol_params(self, spectral_info):
+        """工作增益超出发射机规范（增益-NF 表的增益范围）时，先把增益钳制到表的上下限
+
+        钳制在上游的饱和门限（``min(effective_gain, p_max - pin_db)``）之前完成，
+        因此增益谱、输出功率与 NF 都按钳制后的增益计算。
+
+        :param spectral_info: The spectral information object.
+        :type spectral_info: SpectralInformation
+        """
+        if self.nf_curve is not None and self.effective_gain is not None:
+            gains = self.nf_curve[0]
+            clamped_gain = min(max(self.effective_gain, gains[0]), gains[-1])
+            if clamped_gain != self.effective_gain:
+                logger.warning(f'{self.uid}: gain {self.effective_gain:.2f} dB is outside the {NF_CURVE_KEY} gain '
+                               f'range [{gains[0]:.2f}, {gains[-1]:.2f}] dB: clamped to {clamped_gain:.2f} dB')
+                self.effective_gain = clamped_gain
+        super().interpol_params(spectral_info)
 
     def _calc_nf(self, avg=False):
         """返回各频率切片的 NF [dB]；avg=True 时返回标量平均 NF（上游自动设计使用）"""

@@ -126,7 +126,7 @@ AMP_GAIN_MARGIN_DB = 2.0
 # 光放输出的默认倾斜 [dB]（gnpy 的 tilt_target：负值 = 高频/短波长端增益高，正值相反；
 # 倾斜量定义在放大器整个频带上，见 Edfa._gain_profile）。
 # 这里取负值，即高频端增益比低频端高：C96 2 dB、L96 1 dB
-AMP_TILT_DB = {'C96': -2.0, 'L96': -1.0}
+AMP_TILT_DB = {'C96': -2.6, 'L96': -1.3}
 
 amp_gain = {}   # {(光放名, 波段): 增益 [dB]}
 for band, nch, p_max_dbm in AMP_BANDS:
@@ -243,6 +243,12 @@ def band_power_dbm(si):
     return {band: watt2dbm(sum(si.pch[sl])) for band, sl in slices.items()}
 
 
+def band_power_stats_dbm(si):
+    """按波段统计各波道功率的（最差, 平均, 最好）[dBm]"""
+    return {band: (si.pch_dbm[sl].min(), si.pch_dbm[sl].mean(), si.pch_dbm[sl].max())
+            for band, sl in slices.items()}
+
+
 def osnr_db(si):
     """逐波长 OSNR [dB]（累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz）
 
@@ -262,17 +268,19 @@ def band_osnr_db(osnr):
     return {band: (osnr[sl].min(), osnr[sl].mean(), osnr[sl].max()) for band, sl in slices.items()}
 
 
-# 逐器件传播，同时记录每个器件分波段的输入/输出总功率和 OSNR（另存逐波长 OSNR 供画图）
-device_power = []    # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
-device_osnr = []     # [(器件名, 类型, {波段: 输入 dB}, {波段: 输出 dB})]
-device_osnr_wl = []  # [(器件名, 类型, 输入逐波长 OSNR, 输出逐波长 OSNR)]
+# 逐器件传播，同时记录每个器件分波段的输入/输出总功率、单波功率统计和 OSNR（另存逐波长 OSNR 供画图）
+device_power = []       # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
+device_power_wl = []    # [(器件名, 类型, {波段: 输入单波功率}, {波段: 输出单波功率})]，值为 (最差, 平均, 最好)
+device_osnr = []        # [(器件名, 类型, {波段: 输入 dB}, {波段: 输出 dB})]
+device_osnr_wl = []     # [(器件名, 类型, 输入逐波长 OSNR, 输出逐波长 OSNR)]
 oa2_out_pch_dbm = None
 for uid, dev_type, apply in CHAIN:
-    pin_band = band_power_dbm(si)
+    pin_band, pin_stats = band_power_dbm(si), band_power_stats_dbm(si)
     osnr_in_wl = osnr_db(si)
     si = apply(si)
     osnr_out_wl = osnr_db(si)
     device_power.append((uid, dev_type, pin_band, band_power_dbm(si)))
+    device_power_wl.append((uid, dev_type, pin_stats, band_power_stats_dbm(si)))
     device_osnr.append((uid, dev_type, band_osnr_db(osnr_in_wl), band_osnr_db(osnr_out_wl)))
     device_osnr_wl.append((uid, dev_type, osnr_in_wl, osnr_out_wl))
     if uid == 'OA2':
@@ -283,7 +291,8 @@ srs_attenuation_only = srs_holder['attenuation_only']
 
 assert si.number_of_channels == len(frequency), '光放频带把部分波长滤掉了，请检查 f_min / f_max'
 
-print('\n光放工作点（输入/输出为该波段总功率，输出应等于该型号的 p_max；NF 由增益-NF 表查得）：')
+print('\n光放工作点（输入/输出为该波段总功率；增益被规范钳制或饱和时输出会低于额定 p_max；'
+      'NF 由增益-NF 表查得）：')
 for uid, amplifier in (('OA1', oa1), ('OA2', oa2)):
     for band_name, sub_amp in amplifier.amplifiers.items():
         print(f'  {uid} {band_name:>6} {sub_amp.params.type_variety}：增益 {sub_amp.effective_gain:.2f} dB，'
@@ -335,8 +344,8 @@ def fmt(value):
     return f'{value:.2f}' if isfinite(value) else '-'
 
 
-def fmt_osnr(stats):
-    """波段内各波长 OSNR 的统计值：最差 / 平均 / 最好"""
+def fmt_stats(stats):
+    """波段内各波长的统计值：最差 / 平均 / 最好（OSNR 用 dB，功率用 dBm）"""
     return ' / '.join(fmt(value) for value in stats)
 
 
@@ -369,12 +378,22 @@ osnr_rows = []
 for uid, dev_type, osnr_in_band, osnr_out_band in device_osnr:
     cells = []
     for band in BANDS:
-        cells += [fmt_osnr(osnr_in_band[band]), fmt_osnr(osnr_out_band[band])]
+        cells += [fmt_stats(osnr_in_band[band]), fmt_stats(osnr_out_band[band])]
     osnr_rows.append((uid, dev_type, cells))
 print_device_table(f'各器件 OSNR（单元格式为 最差 / 平均 / 最好；仅计 ASE，含发射机 tx_osnr {tx_osnr_db:.0f} dB，'
                    f'折算到 0.1 nm / 12.5 GHz）',
                    [f'{band} {side}(dB)' for band in BANDS for side in ('输入', '输出')],
                    osnr_rows)
+
+power_wl_rows = []
+for uid, dev_type, pin_stats, pout_stats in device_power_wl:
+    cells = []
+    for band in BANDS:
+        cells += [fmt_stats(pin_stats[band]), fmt_stats(pout_stats[band])]
+    power_wl_rows.append((uid, dev_type, cells))
+print_device_table('各器件单波功率（单元格式为 最差 / 平均 / 最好；含噪声）',
+                   [f'{band} {side}(dBm)' for band in BANDS for side in ('输入', '输出')],
+                   power_wl_rows)
 
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 64 波）
