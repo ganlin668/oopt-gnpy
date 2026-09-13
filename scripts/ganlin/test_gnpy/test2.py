@@ -28,10 +28,11 @@ from numpy import concatenate, errstate, isfinite
 from rich.console import Console
 from rich.table import Table
 
+from gnpy.bplab.edfa import GainNfMultibandAmplifier
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import band_center_frequencies
-from gnpy.core.elements import Fiber, Multiband_amplifier, Transceiver
+from gnpy.core.elements import Fiber, Transceiver
 from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
 from gnpy.core.parameters import SimParams, TransceiverRole
@@ -113,8 +114,11 @@ trx_params = {'system_margin': si_default.sys_margins}
 
 
 def build_multiband_amp(uid, latitude):
-    """搭建 C/L 双波段光放；amplifiers 顺序决定合波后的信道顺序，L96 在前以保证频谱升序"""
-    return Multiband_amplifier(
+    """搭建 C/L 双波段光放；amplifiers 顺序决定合波后的信道顺序，L96 在前以保证频谱升序
+
+    用 gnpy.bplab.edfa.GainNfMultibandAmplifier：子光放的 NF 按设备库里的增益-NF 表查得
+    """
+    return GainNfMultibandAmplifier(
         uid=uid, type_variety='C96L96_SGA_multiband',
         params=dict(equipment['Edfa']['C96L96_SGA_multiband'].__dict__),
         amplifiers=[
@@ -236,11 +240,12 @@ srs_attenuation_only = srs_holder['attenuation_only']
 
 assert si.number_of_channels == len(frequency), '光放频带把部分波长滤掉了，请检查 f_min / f_max'
 
-print('\n光放工作点（输入/输出为该波段总功率，输出应等于该型号的 p_max）：')
+print('\n光放工作点（输入/输出为该波段总功率，输出应等于该型号的 p_max；NF 由增益-NF 表查得）：')
 for uid, amplifier in (('OA1', oa1), ('OA2', oa2)):
     for band_name, sub_amp in amplifier.amplifiers.items():
         print(f'  {uid} {band_name:>6} {sub_amp.params.type_variety}：增益 {sub_amp.effective_gain:.2f} dB，'
-              f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm')
+              f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm，'
+              f'NF {sub_amp.nf.mean():.2f} dB')
 
 # ---------------------------------------------------------------- 每波长的噪声受限 SNR
 # SNR_ASE 按含滚降的实际信号带宽 BW*(1+Rolloff) 计算；SNR_NLI 为绝对量

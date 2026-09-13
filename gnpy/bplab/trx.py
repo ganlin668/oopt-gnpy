@@ -23,6 +23,7 @@ from logging import getLogger
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from gnpy.bplab.edfa import attach_nf_curves, extract_nf_curves
 from gnpy.tools.convert_legacy_yang import yang_to_legacy
 from gnpy.tools.default_edfa_config import DEFAULT_EXTRA_CONFIG
 from gnpy.tools.json_io import Transceiver, _equipment_from_json, load_json
@@ -145,18 +146,24 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     （YANG 模型不接受该字段），其余字段仍照常走 gnpy 的 YANG 校验与转换；
     转换后再把 tx_power 回填，并同步写入 gnpy 消费的 tx-channel-power-max-dbm。
 
+    同样手法处理 Edfa 条目的 bplab 扩展字段 nf_vs_gain（增益 -> NF 表，YANG 模型也不接受）：
+    校验前摘掉，校验后挂到 equipment['Edfa'][型号] 上，供 gnpy.bplab.edfa.GainNfEdfa 使用。
+
     :param filename: 设备库 json 路径
     :param extra_configs: 附加配置（advanced_config_from_json 引用），默认 gnpy 自带的
     :return: 设备库字典
     """
     raw = load_json(Path(filename))
     extracted = _extract_module_power(raw)
+    nf_curves = extract_nf_curves(raw)
     # YANG 模型不识别 bplab 扩展段 Passive（由 gnpy.bplab.passives.load_passive_library 单独解析），
     # 与 tx_power 同一手法：先摘掉才能通过 libyang 校验
     raw.pop('Passive', None)
     json_data = yang_to_legacy(raw)
     _inject_module_power(json_data, extracted)
-    return _equipment_from_json(json_data, extra_configs)
+    equipment = _equipment_from_json(json_data, extra_configs)
+    attach_nf_curves(equipment, nf_curves)
+    return equipment
 
 
 def launch_power_dbm(mode: Dict, requested_dbm: Optional[float] = None) -> Optional[float]:
