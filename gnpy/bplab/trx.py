@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Union
 
 from gnpy.bplab.edfa import (BPLAB_EXTRA_CONFIGS, attach_nf_curves, extract_nf_curves, restore_gain_range,
                              stub_gain_range_for_curves)
+from gnpy.bplab.raman import attach_raman_gain, extract_raman_gain
 from gnpy.tools.convert_legacy_yang import yang_to_legacy
 from gnpy.tools.default_edfa_config import DEFAULT_EXTRA_CONFIG
 from gnpy.tools.json_io import Transceiver, _equipment_from_json, load_json
@@ -155,6 +156,10 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     另外自动并入 bplab 自带的光放附加配置（见 gnpy.bplab.edfa.BPLAB_EXTRA_CONFIGS），
     设备库条目可直接用 default_config_from_json 引用其中的文件名（如 'linear_dgt.json'）。
 
+    同样手法处理 Fiber 条目的 bplab 扩展段 raman_gain（拉曼增益峰值/参考波长/波长缩放指数，
+    YANG 模型也不接受）：校验前摘掉，校验后挂到 equipment['Fiber'][型号] 上，
+    供 gnpy.bplab.raman.SrsFiber 使用。
+
     :param filename: 设备库 json 路径
     :param extra_configs: 附加配置（advanced/default_config_from_json 引用），默认 gnpy 自带的，
         与 bplab 自带的合并后使用
@@ -166,6 +171,7 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     # 必须在 extract_nf_curves 之前：后者会把 nf_vs_gain 摘掉，本函数据此判断哪些光放走查表
     stubbed_gain_min = stub_gain_range_for_curves(raw)
     nf_curves = extract_nf_curves(raw)
+    raman_gain = extract_raman_gain(raw)
     # YANG 模型不识别 bplab 扩展段 Passive（由 gnpy.bplab.passives.load_passive_library 单独解析），
     # 与 tx_power 同一手法：先摘掉才能通过 libyang 校验
     raw.pop('Passive', None)
@@ -173,6 +179,7 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     _inject_module_power(json_data, extracted)
     equipment = _equipment_from_json(json_data, extra_configs)
     attach_nf_curves(equipment, nf_curves)
+    attach_raman_gain(equipment, raman_gain)
     restore_gain_range(equipment, stubbed_gain_min)
     return equipment
 

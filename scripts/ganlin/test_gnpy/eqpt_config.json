@@ -121,7 +121,12 @@
       "type_variety": "G.652.D",
       "dispersion": 1.67e-05,
       "effective_area": 83e-12,
-      "pmd_coef": 1.265e-15
+      "pmd_coef": 1.265e-15,
+      "raman_gain": {
+        "gR_peak": 0.38e-3,
+        "reference_wavelength": 1480.0e-9,
+        "ns": 2.313
+      }
     }
   ],
   "SI": [

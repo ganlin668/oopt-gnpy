@@ -17,8 +17,10 @@ test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 逐个搭建完整光路�
   且光放 DGT 换成严格线性斜线（linear_dgt.json），因此倾斜是精确直线、没有曲率残差
 - 频点取自 gnpy.bplab.utils（150 GHz 栅格用 band_filling_center_frequencies 从波段下边缘铺满，
   C96 / L96 各 32 波，共 64 波）
-- 光纤默认 G.652.D，衰减系数按波长相关解析模型给出（gnpy.bplab.fibers，锚定 1550 nm = 0.275 dB/km）
-- 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长以及 C96 / L96 各波段总功率的 SRS 转移量
+- 光纤默认 G.652.D，衰减系数按波长相关解析模型给出（gnpy.bplab.fibers，锚定 1550 nm = 0.25 dB/km）
+- 光纤用 gnpy.bplab.raman.SrsFiber：SRS 由 gnpy.bplab.raman.RamanSolver（solve_ivp 解耦合功率方程）计算，
+  拉曼参数（gR 峰值 0.38e-3、参考波长 1480 nm、缩放指数 2.313）取自设备库 G.652.D 条目的 raman_gain 段，
+  并打印首/末波长以及 C96 / L96 各波段总功率的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE
 - 绘制光纤输入/输出、OA2 输出、接收端的功率谱
 - 另存两张图：光纤衰减系数 vs 波长、各位置（光纤输入/输出、OA2 输出、接收端）的逐波长 OSNR
@@ -35,13 +37,13 @@ from rich.table import Table
 from gnpy.bplab.edfa import GainNfMultibandAmplifier
 from gnpy.bplab.fibers import loss_coef_table
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
+from gnpy.bplab.raman import RamanSolver, SrsFiber
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import DWDM_BAND_RANGES, band_filling_center_frequencies
-from gnpy.core.elements import Fiber, Transceiver
+from gnpy.core.elements import Transceiver
 from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
-from gnpy.core.parameters import SimParams, TransceiverRole
-from gnpy.core.science_utils import RamanSolver
+from gnpy.core.parameters import TransceiverRole
 from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm
 
 # matplotlib 默认字体不含中文字形，必须指定中文字体，否则图中文字显示为方框
@@ -65,10 +67,10 @@ tx_osnr_db = trx_mode['tx_osnr']  # 发射机自身 OSNR，本案例 41 dB
 # 模块最大出光功率 tx_power，作为每波道发射功率的默认值并作为上限
 launch_dbm = launch_power_dbm(trx_mode)
 
-# 开启 SRS：RamanParams.flag 默认 False，不打开则 Fiber.propagate 只做纯衰减
-SimParams.set_params({'raman_params': {'flag': True,
-                                       'solver_spatial_resolution': 50,
-                                       'result_spatial_resolution': 10e3}})
+# SRS 由 gnpy.bplab.raman.RamanSolver（solve_ivp 解耦合功率方程）在光纤传播时计算，
+# 开关与空间分辨率来自 gnpy.bplab.raman.RamanParams（默认 flag=True、求解步长 50 m、结果 10 km），
+# 拉曼参数（gR 峰值 / 参考波长 1480 nm / 缩放指数 2.313）由 SrsFiber 从设备库的 raman_gain 段读取；
+# 上游 SimParams.raman_params 已不参与本链路的 SRS 计算（本链路没有用上游 Fiber）
 
 # ---------------------------------------------------------------- 链路参数
 length_km = 80.0
@@ -101,7 +103,7 @@ si = create_arbitrary_spectral_information(
 
 # 色散 / 有效面积 / PMD 系数取自设备库；衰减系数用 gnpy.bplab.fibers 的解析曲线
 # （G.652.D：A/λ^4 + B*exp(-C/λ) + corr），并整体平移使 1550 nm 处正好等于 loss_coef。
-# FiberParams.ref_wavelength 默认就是 1550 nm，故单跨损耗仍按 0.275 dB/km 结算。
+# FiberParams.ref_wavelength 默认就是 1550 nm，故单跨损耗仍按 loss_coef（0.25 dB/km）结算。
 fiber_params = dict(equipment['Fiber'][FIBER_TYPE].__dict__)
 fiber_params.update(length=length_km, length_units='km', att_in=0, con_in=con_in, con_out=con_out,
                     pmd_coef=3.0e-15,
@@ -177,8 +179,8 @@ voa_tx.params.loss['C96'] = 3.5
 voa_tx.params.loss['L96'] = 3.5
 oa1 = build_multiband_amp('OA1', 3)
 fiu1 = build_passive('FIU1', 'FIU', 4)
-fiber = Fiber(uid='Span1', type_variety=FIBER_TYPE, params=fiber_params,
-              metadata={'location': {'city': '', 'region': '', 'latitude': 5, 'longitude': 0}})
+fiber = SrsFiber(uid='Span1', type_variety=FIBER_TYPE, params=fiber_params,
+                 metadata={'location': {'city': '', 'region': '', 'latitude': 5, 'longitude': 0}})
 fiu2 = build_passive('FIU2', 'FIU', 6)
 oa2 = build_multiband_amp('OA2', 7)
 voa_rx = build_passive('VOA_Rx', 'VOA', 8)
@@ -203,8 +205,9 @@ print(f'频谱：{si.number_of_channels} 波（L96 {len(l96_centers)} + C96 {len
       f'每波道 {launch_dbm:.1f} dBm（共 {si.ptot_dbm:.2f} dBm）')
 
 # ---------------------------------------------------------------- 传播（按光路顺序）
-# Fiber.propagate 内部会自己算一遍 SRS 但不落属性，这里单独求解一次，
-# 用于打印 SRS 转移量并画光纤输入/输出功率谱。必须在光纤传播前、用光纤输入谱求解
+# fiber.propagate(SrsFiber) 内部用 gnpy.bplab.raman.RamanSolver 算一遍 SRS 并施加衰减，
+# 但求解结果不落在属性上，这里按同样的入纤谱再求解一次，用于打印 SRS 转移量并画光纤输入/输出功率谱。
+# 必须在光纤传播前、用光纤输入谱求解（传播会就地修改光谱）
 srs_holder = {}
 
 
@@ -223,7 +226,7 @@ CHAIN = (
     ('VOA_Tx', 'BandAttenuator', voa_tx),
     ('OA1', 'Multiband_amplifier', oa1),
     ('FIU1', 'BandAttenuator', fiu1),
-    ('Span1', 'Fiber', propagate_fiber),
+    ('Span1', 'SrsFiber', propagate_fiber),
     ('FIU2', 'BandAttenuator', fiu2),
     ('OA2', 'Multiband_amplifier', oa2),
     ('VOA_Rx', 'BandAttenuator', voa_rx),
