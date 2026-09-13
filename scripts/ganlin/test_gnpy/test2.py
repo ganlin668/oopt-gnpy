@@ -299,21 +299,6 @@ for uid, amplifier in (('OA1', oa1), ('OA2', oa2)):
               f'{sub_amp.pin_db:.2f} dBm → {sub_amp.pout_db:.2f} dBm，'
               f'NF {sub_amp.nf.mean():.2f} dB')
 
-# ---------------------------------------------------------------- 每波长的噪声受限 SNR
-# SNR_ASE 按含滚降的实际信号带宽 BW*(1+Rolloff) 计算；SNR_NLI 为绝对量
-bw_eff = si.baud_rate * (1 + si.roll_off)   # 实际信号带宽 [Hz]，本案例 131.3 GHz x 1.05 = 137.865 GHz
-p_ase = si.ase * (1 + si.roll_off)          # ASE 噪声功率折算到 bw_eff
-snr_ase = lin2db(si.signal / p_ase)
-snr_nli = lin2db(si.signal / si.nli)
-
-print(f'\n噪声口径：SNR_ASE 用 BW*(1+Rolloff) = {bw_eff[0] * 1e-9:.2f} GHz；SNR_NLI 为绝对量')
-
-print(f'\n{"Band":>4} {"Ch":>3} {"频率(THz)":>10} {"功率(dBm)":>9} {"SNR_NLI":>9} {"SNR_ASE":>9}')
-for band_name, sl in slices.items():
-    for i in range(si.number_of_channels)[sl]:
-        print(f'{band_name:>4} {i - sl.start + 1:>3} {si.frequency[i] * 1e-12:>10.4f} '
-              f'{si.pch_dbm[i]:>9.2f} {snr_nli[i]:>9.2f} {snr_ase[i]:>9.2f}')
-
 # ---------------------------------------------------------------- SRS 转移量
 transfer_db = lin2db(srs.power_profile[:, -1]) - lin2db(srs_attenuation_only.power_profile[:, -1])
 print('\nSRS 转移量（有 SRS 相对纯衰减的输出功率变化）：')
