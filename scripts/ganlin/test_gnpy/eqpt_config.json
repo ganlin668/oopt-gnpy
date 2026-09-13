@@ -5,6 +5,7 @@
       "f_min": 186.275e12,
       "f_max": 191.075e12,
       "type_def": "variable_gain",
+      "default_config_from_json": "linear_dgt.json",
       "gain_flatmax": 30,
       "gain_min": 12,
       "p_max": 21,
@@ -39,6 +40,7 @@
       "f_min": 191.275e12,
       "f_max": 196.075e12,
       "type_def": "variable_gain",
+      "default_config_from_json": "linear_dgt.json",
       "gain_flatmax": 30,
       "gain_min": 12,
       "p_max": 22,
@@ -111,6 +113,12 @@
   "Fiber": [
     {
       "type_variety": "SSMF",
+      "dispersion": 1.67e-05,
+      "effective_area": 83e-12,
+      "pmd_coef": 1.265e-15
+    },
+    {
+      "type_variety": "G.652.D",
       "dispersion": 1.67e-05,
       "effective_area": 83e-12,
       "pmd_coef": 1.265e-15

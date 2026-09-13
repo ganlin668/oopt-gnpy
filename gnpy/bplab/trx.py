@@ -23,7 +23,7 @@ from logging import getLogger
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from gnpy.bplab.edfa import (attach_nf_curves, extract_nf_curves, restore_gain_range,
+from gnpy.bplab.edfa import (BPLAB_EXTRA_CONFIGS, attach_nf_curves, extract_nf_curves, restore_gain_range,
                              stub_gain_range_for_curves)
 from gnpy.tools.convert_legacy_yang import yang_to_legacy
 from gnpy.tools.default_edfa_config import DEFAULT_EXTRA_CONFIG
@@ -152,10 +152,15 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     带该表的光放不再需要上游 variable_gain 的 2 级 NF 模型，但其拟合合法性校验会拒绝加载
     （拟合出的 ΔP 越界时），故加载前把这类条目的 gain_min 换成占位值、加载后还原。
 
+    另外自动并入 bplab 自带的光放附加配置（见 gnpy.bplab.edfa.BPLAB_EXTRA_CONFIGS），
+    设备库条目可直接用 default_config_from_json 引用其中的文件名（如 'linear_dgt.json'）。
+
     :param filename: 设备库 json 路径
-    :param extra_configs: 附加配置（advanced_config_from_json 引用），默认 gnpy 自带的
+    :param extra_configs: 附加配置（advanced/default_config_from_json 引用），默认 gnpy 自带的，
+        与 bplab 自带的合并后使用
     :return: 设备库字典
     """
+    extra_configs = {**extra_configs, **BPLAB_EXTRA_CONFIGS}
     raw = load_json(Path(filename))
     extracted = _extract_module_power(raw)
     # 必须在 extract_nf_curves 之前：后者会把 nf_vs_gain 摘掉，本函数据此判断哪些光放走查表

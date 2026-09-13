@@ -11,10 +11,11 @@ Unit tests for the gain dependent noise figure EDFA in gnpy.bplab.edfa
 from pathlib import Path
 
 import pytest
-from numpy import concatenate, interp
+from numpy import arange, concatenate, interp, polyfit, polyval
 from numpy.testing import assert_allclose
 
-from gnpy.bplab.edfa import (NF_CURVE_KEY, GainNfEdfa, GainNfMultibandAmplifier, attach_nf_curves,
+from gnpy.bplab.edfa import (BPLAB_EXTRA_CONFIGS, LINEAR_DGT_CONFIG, LINEAR_DGT_CONFIG_NAME, NF_CURVE_KEY,
+                             GainNfEdfa, GainNfMultibandAmplifier, attach_nf_curves,
                              extract_nf_curves, parse_nf_curve, restore_gain_range,
                              stub_gain_range_for_curves)
 from gnpy.bplab.trx import load_equipment_with_module_power
@@ -46,10 +47,10 @@ def make_si(bands=('L96', 'C96')):
         slot_width=SPACING, roll_off=0.05, tx_power=dbm2watt(-6))
 
 
-def make_amp(variety, gain_target, equipment):
-    """按设备库参数建单波段光放（operational 里给出工作增益）"""
+def make_amp(variety, gain_target, equipment, tilt_target=0):
+    """按设备库参数建单波段光放（operational 里给出工作增益与倾斜）"""
     return GainNfEdfa(uid='OA1', params=dict(equipment['Edfa'][variety].__dict__),
-                      operational={'gain_target': gain_target, 'tilt_target': 0})
+                      operational={'gain_target': gain_target, 'tilt_target': tilt_target})
 
 
 def table_of(variety, equipment):
@@ -101,6 +102,37 @@ def test_loader_restores_declared_gain_range(equipment):
         # 上游把 nf_min/nf_max 收进 nf_model，Amp 上不再保留同名字段
         assert amp.nf_model.orig_nf_min == entry['nf_min']
         assert amp.nf_model.orig_nf_max == entry['nf_max']
+
+
+def test_linear_dgt_config_is_strictly_linear():
+    """bplab 自带的 linear_dgt.json：DGT 是严格直线，且不引入 gain / nf 纹波"""
+    dgt = LINEAR_DGT_CONFIG['dgt']
+    index = arange(len(dgt))
+    residual = dgt - polyval(polyfit(index, dgt, 1), index)
+    assert max(abs(residual)) < 1e-12
+    assert LINEAR_DGT_CONFIG['gain_ripple'] == [0.0]
+    assert LINEAR_DGT_CONFIG['nf_ripple'] == [0.0]
+
+
+def test_loader_provides_bplab_extra_configs(equipment):
+    """设备库条目用 default_config_from_json 引用 'linear_dgt.json'，由加载器自动并入"""
+    assert LINEAR_DGT_CONFIG_NAME in BPLAB_EXTRA_CONFIGS
+    for variety in (C96_VARIETY, L96_VARIETY):
+        amp = equipment['Edfa'][variety]
+        assert list(amp.dgt) == LINEAR_DGT_CONFIG['dgt']
+        assert list(amp.gain_ripple) == [0.0]
+
+
+def test_gain_profile_is_strictly_linear_with_tilt(equipment):
+    """linear_dgt 下施加 tilt 后增益谱是精确直线：跨度 = tilt_target × 使用频带 / 放大器频带"""
+    amp = make_amp(C96_VARIETY, 22.0, equipment, tilt_target=-2.0)
+    amp.interpol_params(make_si(bands=('C96',)))
+
+    index = arange(len(amp.gprofile))
+    residual = amp.gprofile - polyval(polyfit(index, amp.gprofile, 1), index)
+    assert max(abs(residual)) < 1e-9
+    expected = 2.0 * (amp.channel_freq[-1] - amp.channel_freq[0]) / (amp.params.f_max - amp.params.f_min)
+    assert amp.gprofile[-1] - amp.gprofile[0] == pytest.approx(expected, rel=1e-6)
 
 
 def test_stub_gain_range_only_touches_unfittable_entries_with_curve():

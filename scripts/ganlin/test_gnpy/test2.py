@@ -13,22 +13,26 @@ test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 逐个搭建完整光路�
 - Mux / Demux / VOA / FIU 只做衰减建模，插损按 C96 / L96 波段分别配置在设备库的 Passive 段；
   因 gnpy 的 Fused 只支持标量插损，这里用 gnpy.bplab.passives.BandAttenuator
 - 两级 OA 都用 C96_SGA_22dBm / L96_SGA_21dBm（C/L 双波段），各自工作在额定总输出功率
-  22 / 21 dBm：增益取 p_max - 该波段输入总功率
+  22 / 21 dBm：增益取 p_max - 该波段输入总功率；输出默认带倾斜（高频端比低频端高 C96 2 dB / L96 1 dB），
+  且光放 DGT 换成严格线性斜线（linear_dgt.json），因此倾斜是精确直线、没有曲率残差
 - 频点取自 gnpy.bplab.utils.band_center_frequencies（按模块 min_spacing = 150 GHz 取 C96 / L96 栅格）
-- 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长的 SRS 转移量
+- 光纤默认 G.652.D，衰减系数按波长相关解析模型给出（gnpy.bplab.fibers，锚定 1550 nm = 0.275 dB/km）
+- 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长以及 C96 / L96 各波段平均的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE
 - 绘制光纤输入/输出、OA2 输出、接收端的功率谱
+- 另存两张图：光纤衰减系数 vs 波长、各位置（光纤输入/输出、OA2 输出、接收端）的逐波长 OSNR
 """
 
 from pathlib import Path
 
 from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
-from numpy import array, concatenate, errstate, interp, isfinite
+from numpy import concatenate, errstate, isfinite
 from rich.console import Console
 from rich.table import Table
 
 from gnpy.bplab.edfa import GainNfMultibandAmplifier
+from gnpy.bplab.fibers import loss_coef_table
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import band_center_frequencies
@@ -37,7 +41,7 @@ from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
 from gnpy.core.parameters import SimParams, TransceiverRole
 from gnpy.core.science_utils import RamanSolver
-from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm, wavelength2freq
+from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm
 
 # matplotlib 默认字体不含中文字形，必须指定中文字体，否则图中文字显示为方框
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DengXian']
@@ -47,6 +51,11 @@ rcParams['axes.unicode_minus'] = False
 # ---------------------------------------------------------------- 设备库 / 模块参数
 # 上游的 gnpy/example-data/eqpt_config.json 不动，模块性能写在同目录的本地副本里
 EQPT_CONFIG = Path(__file__).parent / 'eqpt_config.json'
+
+# 光放附加配置：设备库条目用 default_config_from_json 指向 "linear_dgt.json"，
+# 把 DGT 换成严格线性的斜线（0 → 1，96 点），gain_ripple / nf_ripple 保持 0，
+# 这样施加 tilt_target 时增益谱就是精确的直线——不再是默认 DGT 曲线带来的弯曲形状。
+# 该配置由 gnpy.bplab.edfa.BPLAB_EXTRA_CONFIGS 提供，加载器会自动并入 extra_configs
 equipment = load_equipment_with_module_power(EQPT_CONFIG)
 si_default = equipment['SI']['default']
 
@@ -62,31 +71,12 @@ SimParams.set_params({'raman_params': {'flag': True,
 
 # ---------------------------------------------------------------- 链路参数
 length_km = 80.0
-loss_coef = 0.275             # 1550 nm 处的衰减系数 [dB/km]，作为波长相关模型的锚点
+loss_coef = 0.25             # 1550 nm 处的衰减系数 [dB/km]，作为波长相关模型的锚点
+FIBER_TYPE = 'G.652.D'        # 默认光纤类型，衰减谱见 gnpy.bplab.fibers
 span_loss_db_target = 28.0
 con_in = 0.0
 con_out = span_loss_db_target-loss_coef * length_km - con_in  # 连接器损耗 dB
 span_loss_db = loss_coef * length_km + con_in + con_out  # 28.0 dB
-
-# gnpy 没有内置的解析式衰减曲线，但 FiberParams.loss_coef 支持逐波长表：
-#   {'value': [... dB/km ...], 'frequency': [... Hz ...]}，由 Fiber.loss_coef_func 在波段内线性插值。
-# 下表取自仓库自带示例（docs/json.rst 与 tests/data/fiber_slope/eqpt_config_fiber_freq.json 的
-# loss_coef_ripple），是"相对 1550 nm 的起伏"；使用时整体平移，使 1550 nm 处正好为 loss_coef。
-# 注意 FiberParams.ref_wavelength 默认就是 1550 nm（parameters.py），故单跨损耗仍按 0.275 dB/km 计。
-ATTENUATION_REF_WAVELENGTH_NM = 1550.0
-LOSS_COEF_RIPPLE = (          # (频率 [THz], 相对起伏 [dB/km])
-    (185.4923413566740, +0.0086276629224582),
-    (186.0525164113786, +0.0058291554597716),
-    (188.0131291028446, +0.0002321405343985),
-    (189.9912472647702, -0.0016335311073926),
-    (191.0765864332604, -0.0020999490178403),
-    (192.0043763676149, -0.0016335311073926),
-    (194.0175054704595, +0.0006985584448462),
-    (195.9956236323851, +0.0048963196388761),
-    (198.0087527352298, +0.0100269166538015),
-    (200.0218818380744, +0.0160903494896223),
-    (201.9649890590809, +0.0230866181463388),
-)
 
 
 spacing = trx_mode['min_spacing']  # 150 GHz
@@ -105,18 +95,13 @@ si = create_arbitrary_spectral_information(
     baud_rate=baud_rate, roll_off=roll_off, tx_osnr=tx_osnr_db,
     tx_power=dbm2watt(launch_dbm), required_osnr_db_01nm=trx_mode['OSNR'])
 
-# 色散 / 有效面积 / PMD 系数取自设备库，只覆盖与具体链路相关的参数
-# 衰减系数用逐波长表：把示例起伏整体平移，使 1550 nm 处正好等于 loss_coef
-ripple_freq = array([f * 1e12 for f, _ in LOSS_COEF_RIPPLE])     # THz -> Hz
-ripple_db = array([r for _, r in LOSS_COEF_RIPPLE])              # dB/km
-ref_frequency = wavelength2freq(ATTENUATION_REF_WAVELENGTH_NM * 1e-9)
-static_db_per_km = loss_coef - interp(ref_frequency, ripple_freq, ripple_db)
-
-fiber_params = dict(equipment['Fiber']['SSMF'].__dict__)
+# 色散 / 有效面积 / PMD 系数取自设备库；衰减系数用 gnpy.bplab.fibers 的解析曲线
+# （G.652.D：A/λ^4 + B*exp(-C/λ) + corr），并整体平移使 1550 nm 处正好等于 loss_coef。
+# FiberParams.ref_wavelength 默认就是 1550 nm，故单跨损耗仍按 0.275 dB/km 结算。
+fiber_params = dict(equipment['Fiber'][FIBER_TYPE].__dict__)
 fiber_params.update(length=length_km, length_units='km', att_in=0, con_in=con_in, con_out=con_out,
                     pmd_coef=3.0e-15,
-                    loss_coef={'value': (static_db_per_km + ripple_db).tolist(),
-                               'frequency': ripple_freq.tolist()})
+                    loss_coef=loss_coef_table(FIBER_TYPE, frequency, ref_loss_db_per_km=loss_coef))
 
 # ---------------------------------------------------------------- 无源器件插损（按波段）
 # Mux / VOA / FIU / Demux 只做衰减建模，插损按 C96 / L96 分别配置在设备库的 Passive 段
@@ -131,6 +116,11 @@ AMP_BANDS = (('C96', len(c96_centers), equipment['Edfa']['C96_SGA_22dBm'].p_max)
 # 增益余量：实际输入功率会被 SRS 等效应拉偏（本例可达 0.9 dB），留出余量后由 p_max 饱和门限
 # 钳位，输出才严格等于额定总输出功率
 AMP_GAIN_MARGIN_DB = 2.0
+
+# 光放输出的默认倾斜 [dB]（gnpy 的 tilt_target：负值 = 高频/短波长端增益高，正值相反；
+# 倾斜量定义在放大器整个频带上，见 Edfa._gain_profile）。
+# 这里取负值，即高频端增益比低频端高：C96 2 dB、L96 1 dB
+AMP_TILT_DB = {'C96': -2.0, 'L96': -1.0}
 
 amp_gain = {}   # {(光放名, 波段): 增益 [dB]}
 for band, nch, p_max_dbm in AMP_BANDS:
@@ -147,7 +137,8 @@ trx_params = {'system_margin': si_default.sys_margins}
 def build_multiband_amp(uid, latitude):
     """搭建 C/L 双波段光放；amplifiers 顺序决定合波后的信道顺序，L96 在前以保证频谱升序
 
-    用 gnpy.bplab.edfa.GainNfMultibandAmplifier：子光放的 NF 按设备库里的增益-NF 表查得
+    用 gnpy.bplab.edfa.GainNfMultibandAmplifier：子光放的 NF 按设备库里的增益-NF 表查得；
+    输出默认带倾斜（C96 2 dB / L96 1 dB，见 AMP_TILT_DB）
     """
     return GainNfMultibandAmplifier(
         uid=uid, type_variety='C96L96_SGA_multiband',
@@ -156,11 +147,11 @@ def build_multiband_amp(uid, latitude):
             {'type_variety': 'L96_SGA_21dBm',
              'params': dict(equipment['Edfa']['L96_SGA_21dBm'].__dict__),
              'operational': {'gain_target': amp_gain[(uid, 'L96')],
-                             'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}},
+                             'tilt_target': AMP_TILT_DB['L96'], 'out_voa': 0, 'in_voa': 0}},
             {'type_variety': 'C96_SGA_22dBm',
              'params': dict(equipment['Edfa']['C96_SGA_22dBm'].__dict__),
              'operational': {'gain_target': amp_gain[(uid, 'C96')],
-                             'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}}],
+                             'tilt_target': AMP_TILT_DB['C96'], 'out_voa': 0, 'in_voa': 0}}],
         metadata={'location': {'city': '', 'region': '', 'latitude': latitude, 'longitude': 0}})
 
 
@@ -182,7 +173,7 @@ voa_tx.params.loss['C96'] = 3.5
 voa_tx.params.loss['L96'] = 3.5
 oa1 = build_multiband_amp('OA1', 3)
 fiu1 = build_passive('FIU1', 'FIU', 4)
-fiber = Fiber(uid='Span1', type_variety='SSMF', params=fiber_params,
+fiber = Fiber(uid='Span1', type_variety=FIBER_TYPE, params=fiber_params,
               metadata={'location': {'city': '', 'region': '', 'latitude': 5, 'longitude': 0}})
 fiu2 = build_passive('FIU2', 'FIU', 6)
 oa2 = build_multiband_amp('OA2', 7)
@@ -245,32 +236,38 @@ def band_power_dbm(si):
     return {band: watt2dbm(sum(si.pch[sl])) for band, sl in slices.items()}
 
 
-def band_osnr_db(si):
-    """按波段分别统计 OSNR 的（最差, 平均, 最好）[dB]，统计对象是波段内各波长的 OSNR
+def osnr_db(si):
+    """逐波长 OSNR [dB]（累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz）
 
-    单波长 OSNR = 累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz。
     手工建链时 Transceiver(EMITTER) 不往光谱里注入 ASE（上游只在收端 update_snr 里合并
     tx_osnr），因此这里把 tx_osnr 一并计入，否则第一级光放之前的 OSNR 恒为无穷大。
     """
-    ref_db = lin2db(12.5e9 / baud_rate)
-    osnr = {}
     with errstate(divide='ignore'):     # 无 ASE 时 signal / ase 为 inf，与 tx_osnr 合并后仍为有限值
-        for band, sl in slices.items():
-            raw_db = lin2db(si.signal[sl] / si.ase[sl]) - ref_db
-            values = -lin2db(db2lin(-raw_db) + db2lin(-tx_osnr_db))
-            osnr[band] = (values.min(), values.mean(), values.max())
-    return osnr
+        raw_db = lin2db(si.signal / si.ase) - lin2db(12.5e9 / baud_rate)
+        return -lin2db(db2lin(-raw_db) + db2lin(-tx_osnr_db))
 
 
-# 逐器件传播，同时记录每个器件分波段的输入/输出总功率和 OSNR
-device_power = []   # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
-device_osnr = []    # [(器件名, 类型, {波段: 输入 dB}, {波段: 输出 dB})]
+def band_osnr_db(osnr):
+    """把逐波长 OSNR 按波段聚合成（最差, 平均, 最好）[dB]
+
+    :param osnr: :func:`osnr_db` 返回的逐波长 OSNR 数组
+    """
+    return {band: (osnr[sl].min(), osnr[sl].mean(), osnr[sl].max()) for band, sl in slices.items()}
+
+
+# 逐器件传播，同时记录每个器件分波段的输入/输出总功率和 OSNR（另存逐波长 OSNR 供画图）
+device_power = []    # [(器件名, 类型, {波段: 输入 dBm}, {波段: 输出 dBm})]
+device_osnr = []     # [(器件名, 类型, {波段: 输入 dB}, {波段: 输出 dB})]
+device_osnr_wl = []  # [(器件名, 类型, 输入逐波长 OSNR, 输出逐波长 OSNR)]
 oa2_out_pch_dbm = None
 for uid, dev_type, apply in CHAIN:
-    pin_band, osnr_in_band = band_power_dbm(si), band_osnr_db(si)
+    pin_band = band_power_dbm(si)
+    osnr_in_wl = osnr_db(si)
     si = apply(si)
+    osnr_out_wl = osnr_db(si)
     device_power.append((uid, dev_type, pin_band, band_power_dbm(si)))
-    device_osnr.append((uid, dev_type, osnr_in_band, band_osnr_db(si)))
+    device_osnr.append((uid, dev_type, band_osnr_db(osnr_in_wl), band_osnr_db(osnr_out_wl)))
+    device_osnr_wl.append((uid, dev_type, osnr_in_wl, osnr_out_wl))
     if uid == 'OA2':
         oa2_out_pch_dbm = si.pch_dbm.copy()   # OA2 输出谱，用于画图
 
@@ -306,6 +303,9 @@ transfer_db = lin2db(srs.power_profile[:, -1]) - lin2db(srs_attenuation_only.pow
 print('\nSRS 转移量（有 SRS 相对纯衰减的输出功率变化）：')
 print(f'  首波长 {si.frequency[0] * 1e-12:.4f} THz：{transfer_db[0]:+.3f} dB')
 print(f'  末波长 {si.frequency[-1] * 1e-12:.4f} THz：{transfer_db[-1]:+.3f} dB')
+for band_name, band_slice in slices.items():
+    band_transfer = transfer_db[band_slice]
+    print(f'  {band_name} 波段平均（{band_transfer.size} 波的算术平均）：{band_transfer.mean():+.3f} dB')
 
 # ---------------------------------------------------------------- 器件链路汇总（最终输出）
 print('\n器件连接顺序（Tx -> Rx）：')
@@ -371,13 +371,17 @@ output_dir = Path(__file__).parent / 'temp'
 output_dir.mkdir(parents=True, exist_ok=True)
 
 figure(figsize=(11, 5))
-plot(wavelength_nm, watt2dbm(srs.power_profile[:, 0]), label='光纤输入（OA1 输出经 FIU1）')
-plot(wavelength_nm, watt2dbm(srs.power_profile[:, -1]), label='光纤输出（OA2 输入，含 SRS）')
-plot(wavelength_nm, oa2_out_pch_dbm, label='OA2 输出（C96 22 dBm / L96 21 dBm 总功率）')
-plot(wavelength_nm, si.pch_dbm, label='接收端（VOA + Demux 后）')
+# 四条曲线都用圆点标出每个波长的功率
+plot(wavelength_nm, watt2dbm(srs.power_profile[:, 0]), marker='o', markersize=3,
+     label='光纤输入（OA1 输出经 FIU1）')
+plot(wavelength_nm, watt2dbm(srs.power_profile[:, -1]), marker='o', markersize=3,
+     label='光纤输出（OA2 输入，含 SRS）')
+plot(wavelength_nm, oa2_out_pch_dbm, marker='o', markersize=3,
+     label='OA2 输出（C96 22 dBm / L96 21 dBm 总功率）')
+plot(wavelength_nm, si.pch_dbm, marker='o', markersize=3, label='接收端（VOA + Demux 后）')
 xlabel('波长 (nm)')
 ylabel('每波道功率 (dBm)')
-title(f'C96 + L96 共 {len(frequency)} 波：80 km SSMF + 两级 C/L 双波段光放功率谱')
+title(f'C96 + L96 共 {len(frequency)} 波：{length_km:g} km {FIBER_TYPE} + 两级 C/L 双波段光放功率谱')
 grid(True)
 legend()
 savefig(output_dir / 'spectrum_c96_l96.png', dpi=150)
@@ -389,23 +393,50 @@ savefig(output_dir / 'spectrum_c96_l96.png', dpi=150)
 #   {'value': [...], 'frequency': [...]} → 逐波长表，Fiber.loss_coef_func 会在波段内插值（当前用法）
 # 这里画本链路实际生效的衰减系数，直接反映光纤衰减是否随波长变化
 loss_coef_db_per_km = fiber.loss_coef_func(frequency) * 1e3     # dB/m -> dB/km
-anchor_db_per_km = fiber.loss_coef_func(ref_frequency) * 1e3    # 锚定波长（1550 nm）处
+ref_wavelength_nm = fiber.params.ref_wavelength * 1e9           # 锚定波长（默认 1550 nm）
+anchor_db_per_km = fiber.loss_coef_func(fiber.params.ref_frequency) * 1e3
 coef_span_db = loss_coef_db_per_km.max() - loss_coef_db_per_km.min()
 coef_kind = '（常数，与波长无关）' if coef_span_db == 0 else '（随波长变化）'
 print(f'\n光纤衰减系数（{fiber.type_variety}，{length_km:g} km）：'
       f'{loss_coef_db_per_km.min():.4f} ~ {loss_coef_db_per_km.max():.4f} dB/km，'
       f'波段内起伏 {coef_span_db:.3e} dB/km{coef_kind}')
-print(f'  锚定 {ATTENUATION_REF_WAVELENGTH_NM:.0f} nm 处 {anchor_db_per_km:.4f} dB/km，'
+print(f'  锚定 {ref_wavelength_nm:.0f} nm 处 {anchor_db_per_km:.4f} dB/km，'
       f'对应单跨损耗 {anchor_db_per_km * length_km + con_in + con_out:.2f} dB')
 
 figure(figsize=(11, 5))
-plot(wavelength_nm, loss_coef_db_per_km, marker='.', label='衰减系数（逐波长模型）')
-plot([ATTENUATION_REF_WAVELENGTH_NM], [anchor_db_per_km], marker='o', color='crimson',
-     label=f'{ATTENUATION_REF_WAVELENGTH_NM:.0f} nm 锚点：{anchor_db_per_km:.3f} dB/km')
+plot(wavelength_nm, loss_coef_db_per_km, marker='.', label=f'{FIBER_TYPE} 衰减系数（波长相关模型）')
+plot([ref_wavelength_nm], [anchor_db_per_km], marker='o', color='crimson',
+     label=f'{ref_wavelength_nm:.0f} nm 锚点：{anchor_db_per_km:.3f} dB/km')
 xlabel('波长 (nm)')
 ylabel('衰减系数 (dB/km)')
-title(f'C96 + L96 波段的光纤衰减系数（{fiber.type_variety}，锚定 {ATTENUATION_REF_WAVELENGTH_NM:.0f} nm）')
+title(f'C96 + L96 波段的光纤衰减系数（{fiber.type_variety}，锚定 {ref_wavelength_nm:.0f} nm）')
 grid(True)
 legend()
 savefig(output_dir / 'attenuation_coef_c96_l96.png', dpi=150)
+# show()
+
+# ---------------------------------------------------------------- 各位置逐波长 OSNR vs 波长
+# 与功率谱图取同样的四个位置；纵轴为该位置的逐波长 OSNR，口径与上面的 OSNR 表一致：
+# 累计 ASE 与发射机 tx_osnr 取倒数和，折算到 0.1 nm / 12.5 GHz。
+# 无源器件（Mux / VOA / FIU / Demux）对信号与 ASE 等量衰减，不改变 OSNR，故取哪一级无源器件结果相同
+osnr_interfaces = {uid: (osnr_in, osnr_out) for uid, _, osnr_in, osnr_out in device_osnr_wl}
+OSNR_POSITIONS = (
+    ('光纤输入（OA1 输出经 FIU1）', osnr_interfaces['Span1'][0]),
+    ('光纤输出（OA2 输入，含 SRS）', osnr_interfaces['OA2'][0]),
+    ('OA2 输出（C+L 合波后）', osnr_interfaces['OA2'][1]),
+    ('接收端（VOA + Demux 后）', osnr_interfaces['Site_B'][1]),
+)
+print('\n各位置 OSNR（0.1 nm，含发射机 tx_osnr）：')
+for position, osnr_wl in OSNR_POSITIONS:
+    print(f'  {position}：{osnr_wl.min():.2f} ~ {osnr_wl.max():.2f} dB（平均 {osnr_wl.mean():.2f} dB）')
+
+figure(figsize=(11, 5))
+for position, osnr_wl in OSNR_POSITIONS:
+    plot(wavelength_nm, osnr_wl, marker='o', markersize=3, label=position)
+xlabel('波长 (nm)')
+ylabel('OSNR (dB, 0.1 nm)')
+title(f'各位置的逐波长 OSNR（{FIBER_TYPE}，{length_km:g} km，含发射机 tx_osnr {tx_osnr_db:.0f} dB）')
+grid(True)
+legend()
+savefig(output_dir / 'osnr_c96_l96.png', dpi=150)
 # show()

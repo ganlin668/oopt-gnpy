@@ -49,6 +49,25 @@ NF_CURVE_KEY = 'nf_vs_gain'
 # 旁路上游 2 级拟合时，候选的占位增益跨度 [dB]（相对 gain_flatmax）；按顺序取第一个可拟合的
 PLACEHOLDER_GAIN_SPANS_DB = (5, 8, 10, 12, 14, 15, 16, 17, 11, 13, 18)
 
+# bplab 自带的光放附加配置：设备库条目用 default_config_from_json 引用这些名字，
+# 由 :func:`gnpy.bplab.trx.load_equipment_with_module_power` 自动并入 extra_configs
+# （上游的 extra_configs 只有 gnpy/tools/default_edfa_config.py 里那两份，不改上游文件）。
+#
+# 'linear_dgt.json'：DGT 取严格线性的斜线（0 → 1），gain_ripple / nf_ripple 为 0。
+# 上游默认 DGT 是一条弯曲的曲线（96 点、1.000 → 2.715 dB，除线性后还弯 ±0.24 dB），
+# gnpy 是按 DGT 的形状施加 tilt_target 的，所以默认配置下倾斜会带 ~0.3 dB 的曲率残差；
+# 换成线性 DGT 后，增益谱就是精确的直线（跨度 = tilt_target × 使用频带/放大器频带）。
+LINEAR_DGT_CONFIG_NAME = 'linear_dgt.json'
+LINEAR_DGT_POINTS = 96
+LINEAR_DGT_CONFIG = {
+    'f_min': 186.275e12,    # 条目自身带 f_min/f_max 时会被 json_io 丢弃，这里仅满足其存在性校验
+    'f_max': 196.075e12,
+    'gain_ripple': [0.0],
+    'nf_ripple': [0.0],
+    'dgt': [i / (LINEAR_DGT_POINTS - 1) for i in range(LINEAR_DGT_POINTS)],
+}
+BPLAB_EXTRA_CONFIGS = {LINEAR_DGT_CONFIG_NAME: LINEAR_DGT_CONFIG}
+
 
 def parse_nf_curve(entries: Optional[List[Dict]]) -> Optional[Tuple[array, array]]:
     """把设备库里的增益-NF 表解析成 (gains, nfs) 两个按增益升序排列的数组
