@@ -15,9 +15,10 @@ test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 逐个搭建完整光路�
 - 两级 OA 都用 C96_SGA_22dBm / L96_SGA_21dBm（C/L 双波段），各自工作在额定总输出功率
   22 / 21 dBm：增益取 p_max - 该波段输入总功率；输出默认带倾斜（高频端比低频端高 C96 2 dB / L96 1 dB），
   且光放 DGT 换成严格线性斜线（linear_dgt.json），因此倾斜是精确直线、没有曲率残差
-- 频点取自 gnpy.bplab.utils.band_center_frequencies（按模块 min_spacing = 150 GHz 取 C96 / L96 栅格）
+- 频点取自 gnpy.bplab.utils（150 GHz 栅格用 band_filling_center_frequencies 从波段下边缘铺满，
+  C96 / L96 各 32 波，共 64 波）
 - 光纤默认 G.652.D，衰减系数按波长相关解析模型给出（gnpy.bplab.fibers，锚定 1550 nm = 0.275 dB/km）
-- 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长以及 C96 / L96 各波段平均的 SRS 转移量
+- 光纤传播开启 SRS（SimParams.raman_params.flag），并打印首/末波长以及 C96 / L96 各波段总功率的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE
 - 绘制光纤输入/输出、OA2 输出、接收端的功率谱
 - 另存两张图：光纤衰减系数 vs 波长、各位置（光纤输入/输出、OA2 输出、接收端）的逐波长 OSNR
@@ -35,7 +36,7 @@ from gnpy.bplab.edfa import GainNfMultibandAmplifier
 from gnpy.bplab.fibers import loss_coef_table
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
-from gnpy.bplab.utils import band_center_frequencies
+from gnpy.bplab.utils import DWDM_BAND_RANGES, band_filling_center_frequencies
 from gnpy.core.elements import Fiber, Transceiver
 from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
@@ -84,11 +85,14 @@ baud_rate = trx_mode['baud_rate']  # 131.3 GBaud
 roll_off = trx_mode['roll_off']    # 0.05
 
 # ---------------------------------------------------------------- C96 / L96 频谱（按模块栅格）
-# L96 占用 186.275 ~ 191.075 THz → 150 GHz 栅格下 32 个中心频点 186.35 ~ 191.0 THz
-l96_centers = band_center_frequencies('L96', spacing)
-# C96 占用 191.275 ~ 196.075 THz → 150 GHz 栅格下 31 个中心频点 191.45 ~ 195.95 THz
-c96_centers = band_center_frequencies('C96', spacing)
-frequency = concatenate([l96_centers, c96_centers])  # 升序，共 63 波
+# 波道时隙 = 150 GHz，时隙必须完整落在波段内（gnpy 的 is_in_band 按整个时隙判带）。
+# C96 / L96 的占用带宽都是 4.8 THz = 32 x 150 GHz，所以把波段从下边缘铺满，各得 32 波：
+#   L96 186.35 ~ 191.0 THz，C96 191.35 ~ 196.0 THz（首个时隙正好从波段下边缘开始）
+# 注意不能用 band_center_frequencies()：它把栅格锚定在 193.1 THz 步进 spacing，要求波段边缘
+# 落在该格点上；C96 的 191.275 THz 不满足，用 150 GHz 时只能取到 31 波（191.45 ~ 195.95）
+l96_centers = band_filling_center_frequencies(*DWDM_BAND_RANGES['L96'], spacing)
+c96_centers = band_filling_center_frequencies(*DWDM_BAND_RANGES['C96'], spacing)
+frequency = concatenate([l96_centers, c96_centers])  # 升序，共 64 波（32 + 32）
 
 si = create_arbitrary_spectral_information(
     frequency=frequency, slot_width=spacing, pch=dbm2watt(launch_dbm),
@@ -303,9 +307,15 @@ transfer_db = lin2db(srs.power_profile[:, -1]) - lin2db(srs_attenuation_only.pow
 print('\nSRS 转移量（有 SRS 相对纯衰减的输出功率变化）：')
 print(f'  首波长 {si.frequency[0] * 1e-12:.4f} THz：{transfer_db[0]:+.3f} dB')
 print(f'  末波长 {si.frequency[-1] * 1e-12:.4f} THz：{transfer_db[-1]:+.3f} dB')
+# 波段的转移量取"总功率"口径：10log10(Σ有SRS / Σ纯衰减)，即观察该波段总功率的变化，
+# 而不是波段内各波长 dB 值的算术平均
+power_with_srs = srs.power_profile[:, -1]
+power_without_srs = srs_attenuation_only.power_profile[:, -1]
 for band_name, band_slice in slices.items():
-    band_transfer = transfer_db[band_slice]
-    print(f'  {band_name} 波段平均（{band_transfer.size} 波的算术平均）：{band_transfer.mean():+.3f} dB')
+    band_with_srs = power_with_srs[band_slice]
+    band_without_srs = power_without_srs[band_slice]
+    print(f'  {band_name} 波段总功率变化（{band_with_srs.size} 波，Σ有SRS/Σ纯衰减）：'
+          f'{lin2db(sum(band_with_srs) / sum(band_without_srs)):+.3f} dB')
 
 # ---------------------------------------------------------------- 器件链路汇总（最终输出）
 print('\n器件连接顺序（Tx -> Rx）：')
@@ -364,7 +374,7 @@ print_device_table(f'各器件 OSNR（单元格式为 最差 / 平均 / 最好�
                    osnr_rows)
 
 # ---------------------------------------------------------------- 功率谱
-# 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 63 波）
+# 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 64 波）
 wavelength_nm = freq2wavelength(srs.frequency) * 1e9
 # 图片默认保存到脚本所在目录的 temp 子文件夹（该目录已加入 .gitignore）
 output_dir = Path(__file__).parent / 'temp'

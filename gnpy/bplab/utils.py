@@ -74,3 +74,40 @@ def band_center_frequencies(band_name, spacing=50e9):
     """
     f_min, f_max = DWDM_BAND_RANGES[band_name.upper()]
     return itu_grid_center_frequencies(f_min, f_max, spacing)
+
+
+def band_filling_center_frequencies(f_min, f_max, spacing):
+    """Center frequencies when the band is filled with channels of a given spacing
+
+    The first channel slot starts exactly at f_min, so the plan is
+    f_min + spacing / 2 + k * spacing with k = 0 ... floor((f_max - f_min) / spacing) - 1.
+    Unlike :func:`itu_grid_center_frequencies` (grid anchored at 193.1 THz, which requires the
+    band edges to fall on that grid), this fills the band edge to edge; it is meant for bands
+    whose occupied width is an integer multiple of the spacing, e.g. C96 and L96
+    (4.8 THz = 32 x 150 GHz -> 32 channels each). Using :func:`band_center_frequencies`
+    with a 150 GHz spacing instead only yields 31 channels for C96 (191.45 ~ 195.95 THz),
+    because 191.275 THz is not on the 193.1 THz anchored 150 GHz grid.
+
+    :param f_min Lowest frequency of the band (occupied spectrum lower edge) [Hz]
+    :param f_max Highest frequency of the band (occupied spectrum upper edge) [Hz]
+    :param spacing Grid/channel spacing [Hz]
+    :return Sorted array of the channel center frequencies [Hz], empty if none fits
+
+    >>> len(band_filling_center_frequencies(191.275e12, 196.075e12, 150e9))
+    32
+    >>> round(band_filling_center_frequencies(191.275e12, 196.075e12, 150e9)[0] * 1e-12, 4)
+    191.35
+    >>> round(band_filling_center_frequencies(191.275e12, 196.075e12, 150e9)[-1] * 1e-12, 4)
+    196.0
+    >>> len(band_filling_center_frequencies(186.275e12, 191.075e12, 150e9))
+    32
+    >>> len(band_filling_center_frequencies(191.275e12, 196.075e12, 50e9))
+    96
+    >>> len(band_filling_center_frequencies(191.6e12, 191.9e12, 150e9))
+    2
+    """
+    tolerance = 1e-9
+    n_channels = int(floor((f_max - f_min) / spacing + tolerance))
+    if n_channels <= 0:
+        return array([])
+    return f_min + spacing / 2 + arange(n_channels) * spacing

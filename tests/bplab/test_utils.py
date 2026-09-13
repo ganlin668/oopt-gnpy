@@ -12,7 +12,8 @@ import pytest
 from numpy import arange
 from numpy.testing import assert_allclose
 
-from gnpy.bplab.utils import DWDM_BAND_RANGES, band_center_frequencies, itu_grid_center_frequencies
+from gnpy.bplab.utils import (DWDM_BAND_RANGES, band_center_frequencies, band_filling_center_frequencies,
+                              itu_grid_center_frequencies)
 from gnpy.core.info import create_input_spectral_information
 
 SPACINGS = (50e9, 75e9, 100e9, 150e9, 200e9, 250e9, 300e9)
@@ -23,6 +24,13 @@ EXPECTED_NCH = {
     'L96': (96, 63, 47, 32, 23, 18, 15),
     'C120': (120, 79, 59, 39, 29, 23, 19),
     'L120': (120, 79, 59, 40, 29, 23, 19),
+}
+# 波段从下边缘铺满时的信道数：波道数 = round(波段占用宽度 / spacing)
+EXPECTED_NCH_FILLING = {
+    'C96': (96, 64, 48, 32, 24, 19, 16),
+    'L96': (96, 64, 48, 32, 24, 19, 16),
+    'C120': (120, 80, 60, 40, 30, 24, 20),
+    'L120': (120, 80, 60, 40, 30, 24, 20),
 }
 # 50 GHz 栅格下各波段的首末中心频点 [Hz]
 FIRST_LAST_50GHZ = {
@@ -86,6 +94,45 @@ def test_grid_is_uniform_anchored_and_within_band(band_name):
         # 极大性：栅格上下各再取一个点都会越界
         assert centers[0] - spacing < f_min + spacing / 2 + FREQ_EPS
         assert centers[-1] + spacing > f_max - spacing / 2 - FREQ_EPS
+
+
+@pytest.mark.parametrize('band_name', BAND_NAMES)
+def test_band_filling_channel_count(band_name):
+    f_min, f_max = DWDM_BAND_RANGES[band_name]
+    counts = tuple(len(band_filling_center_frequencies(f_min, f_max, s)) for s in SPACINGS)
+    assert counts == EXPECTED_NCH_FILLING[band_name]
+
+
+@pytest.mark.parametrize('band_name', BAND_NAMES)
+def test_band_filling_fills_band_from_lower_edge(band_name):
+    """首个时隙从波段下边缘开始，均匀步进，再加一波就超出波段"""
+    f_min, f_max = DWDM_BAND_RANGES[band_name]
+    for spacing in SPACINGS:
+        centers = band_filling_center_frequencies(f_min, f_max, spacing)
+        assert centers[0] == pytest.approx(f_min + spacing / 2, abs=FREQ_EPS)
+        assert_allclose(centers, centers[0] + spacing * arange(len(centers)), atol=FREQ_EPS)
+        assert centers[-1] + spacing / 2 <= f_max + FREQ_EPS
+        assert centers[-1] + 3 * spacing / 2 > f_max - FREQ_EPS
+
+
+def test_band_filling_versus_itu_anchor():
+    """C96 排 150 GHz：ITU 锚点口径只有 31 波，波段铺满口径是 32 波（191.35 ~ 196.0 THz）；
+    L96 的波段边缘恰好落在 193.1 THz 的 150 GHz 格点上，两种口径一致"""
+    f_min, f_max = DWDM_BAND_RANGES['C96']
+    assert len(band_center_frequencies('C96', 150e9)) == 31
+    centers = band_filling_center_frequencies(f_min, f_max, 150e9)
+    assert len(centers) == 32
+    assert_allclose(centers[[0, -1]], [191.35e12, 196.0e12], atol=FREQ_EPS)
+
+    l_f_min, l_f_max = DWDM_BAND_RANGES['L96']
+    assert_allclose(band_filling_center_frequencies(l_f_min, l_f_max, 150e9),
+                    band_center_frequencies('L96', 150e9), atol=FREQ_EPS)
+
+
+def test_band_filling_no_channel_fits():
+    assert len(band_filling_center_frequencies(191.3e12, 191.4e12, 1e12)) == 0
+    assert len(band_filling_center_frequencies(191.3e12, 191.3e12, 150e9)) == 0
+    assert len(band_filling_center_frequencies(191.275e12, 191.425e12, 150e9)) == 1
 
 
 def test_no_channel_fits():
