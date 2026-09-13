@@ -147,8 +147,8 @@ def build_multiband_amp(uid, latitude):
     输出默认带倾斜（C96 2 dB / L96 1 dB，见 AMP_TILT_DB）
     """
     return GainNfMultibandAmplifier(
-        uid=uid, type_variety='C96L96_SGA_multiband',
-        params=dict(equipment['Edfa']['C96L96_SGA_multiband'].__dict__),
+        uid=uid, type_variety='C96L96_SGA_multiband_22/21',
+        params=dict(equipment['Edfa']['C96L96_SGA_multiband_22/21'].__dict__),
         amplifiers=[
             {'type_variety': 'L96_SGA_21dBm',
              'params': dict(equipment['Edfa']['L96_SGA_21dBm'].__dict__),
