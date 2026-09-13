@@ -23,7 +23,8 @@ from logging import getLogger
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from gnpy.bplab.edfa import attach_nf_curves, extract_nf_curves
+from gnpy.bplab.edfa import (attach_nf_curves, extract_nf_curves, restore_gain_range,
+                             stub_gain_range_for_curves)
 from gnpy.tools.convert_legacy_yang import yang_to_legacy
 from gnpy.tools.default_edfa_config import DEFAULT_EXTRA_CONFIG
 from gnpy.tools.json_io import Transceiver, _equipment_from_json, load_json
@@ -148,6 +149,8 @@ def load_equipment_with_module_power(filename: Union[str, Path],
 
     同样手法处理 Edfa 条目的 bplab 扩展字段 nf_vs_gain（增益 -> NF 表，YANG 模型也不接受）：
     校验前摘掉，校验后挂到 equipment['Edfa'][型号] 上，供 gnpy.bplab.edfa.GainNfEdfa 使用。
+    带该表的光放不再需要上游 variable_gain 的 2 级 NF 模型，但其拟合合法性校验会拒绝加载
+    （拟合出的 ΔP 越界时），故加载前把这类条目的 gain_min 换成占位值、加载后还原。
 
     :param filename: 设备库 json 路径
     :param extra_configs: 附加配置（advanced_config_from_json 引用），默认 gnpy 自带的
@@ -155,6 +158,8 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     """
     raw = load_json(Path(filename))
     extracted = _extract_module_power(raw)
+    # 必须在 extract_nf_curves 之前：后者会把 nf_vs_gain 摘掉，本函数据此判断哪些光放走查表
+    stubbed_gain_min = stub_gain_range_for_curves(raw)
     nf_curves = extract_nf_curves(raw)
     # YANG 模型不识别 bplab 扩展段 Passive（由 gnpy.bplab.passives.load_passive_library 单独解析），
     # 与 tx_power 同一手法：先摘掉才能通过 libyang 校验
@@ -163,6 +168,7 @@ def load_equipment_with_module_power(filename: Union[str, Path],
     _inject_module_power(json_data, extracted)
     equipment = _equipment_from_json(json_data, extra_configs)
     attach_nf_curves(equipment, nf_curves)
+    restore_gain_range(equipment, stubbed_gain_min)
     return equipment
 
 

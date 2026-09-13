@@ -15,7 +15,8 @@ from numpy import concatenate, interp
 from numpy.testing import assert_allclose
 
 from gnpy.bplab.edfa import (NF_CURVE_KEY, GainNfEdfa, GainNfMultibandAmplifier, attach_nf_curves,
-                             extract_nf_curves, parse_nf_curve)
+                             extract_nf_curves, parse_nf_curve, restore_gain_range,
+                             stub_gain_range_for_curves)
 from gnpy.bplab.trx import load_equipment_with_module_power
 from gnpy.bplab.utils import band_center_frequencies
 from gnpy.core.elements import Edfa
@@ -88,6 +89,49 @@ def test_loader_attaches_nf_curve_to_edfa_entries(equipment):
     assert not hasattr(equipment['Edfa']['C96L96_SGA_multiband'], NF_CURVE_KEY)
 
 
+def test_loader_restores_declared_gain_range(equipment):
+    """L96 声明的增益窗口上游 2 级拟合不接受，加载时用占位值，加载后必须还原成配置值"""
+    raw = load_json(EQPT_CONFIG)
+    for entry in raw['Edfa']:
+        if 'gain_min' not in entry:     # 多波段条目只有 amplifiers 列表
+            continue
+        amp = equipment['Edfa'][entry['type_variety']]
+        assert amp.gain_min == entry['gain_min']
+        assert amp.gain_flatmax == entry['gain_flatmax']
+        # 上游把 nf_min/nf_max 收进 nf_model，Amp 上不再保留同名字段
+        assert amp.nf_model.orig_nf_min == entry['nf_min']
+        assert amp.nf_model.orig_nf_max == entry['nf_max']
+
+
+def test_stub_gain_range_only_touches_unfittable_entries_with_curve():
+    json_data = {'Edfa': [
+        # 能通过上游拟合
+        {'type_variety': 'fittable', 'type_def': 'variable_gain', 'gain_min': 20, 'gain_flatmax': 25,
+         'nf_min': 5.5, 'nf_max': 7, NF_CURVE_KEY: CURVE},
+        # 拟合不合法
+        {'type_variety': 'unfittable', 'type_def': 'variable_gain', 'gain_min': 12, 'gain_flatmax': 30,
+         'nf_min': 5.6, 'nf_max': 12.2, NF_CURVE_KEY: CURVE},
+        # 拟合不合法但没有增益-NF 表：不属于本机制，不应改动
+        {'type_variety': 'no_curve', 'type_def': 'variable_gain', 'gain_min': 12, 'gain_flatmax': 30,
+         'nf_min': 5.6, 'nf_max': 12.2},
+    ]}
+
+    saved = stub_gain_range_for_curves(json_data)
+
+    assert set(saved) == {'unfittable'}
+    assert json_data['Edfa'][0]['gain_min'] == 20
+    assert json_data['Edfa'][1]['gain_min'] != 12
+    assert json_data['Edfa'][2]['gain_min'] == 12
+
+    class DummyAmp:
+        pass
+
+    amp = DummyAmp()
+    amp.gain_min = json_data['Edfa'][1]['gain_min']
+    restore_gain_range({'Edfa': {'unfittable': amp}}, saved)
+    assert amp.gain_min == 12
+
+
 def test_extract_nf_curves_handles_other_name_and_removes_field():
     json_data = {'Edfa': [{'type_variety': 'A', 'other_name': ['A1'], NF_CURVE_KEY: CURVE},
                           {'type_variety': 'B'}]}
@@ -111,6 +155,32 @@ def test_gain_nf_edfa_interpolates_and_clamps(gain_target, equipment):
     amp = make_amp(C96_VARIETY, gain_target, equipment)
     gains, nfs = table_of(C96_VARIETY, equipment)
     assert amp._calc_nf(avg=True) == pytest.approx(interp(gain_target, gains, nfs))
+
+
+def test_gain_nf_edfa_warns_below_table_minimum(equipment, caplog):
+    amp = make_amp(C96_VARIETY, 11.0, equipment)
+    with caplog.at_level('WARNING'):
+        amp._calc_nf(avg=True)
+    assert 'below' in caplog.text
+    assert '11.00 dB' in caplog.text
+    assert '12.00 dB' in caplog.text
+
+
+def test_gain_nf_edfa_warns_above_table_maximum(equipment, caplog):
+    amp = make_amp(C96_VARIETY, 31.0, equipment)
+    with caplog.at_level('WARNING'):
+        amp._calc_nf(avg=True)
+    assert 'above' in caplog.text
+    assert '31.00 dB' in caplog.text
+    assert '30.00 dB' in caplog.text
+
+
+@pytest.mark.parametrize('gain_target', (12.0, 20.0, 30.0))
+def test_gain_nf_edfa_does_not_warn_inside_table_range(gain_target, equipment, caplog):
+    amp = make_amp(C96_VARIETY, gain_target, equipment)
+    with caplog.at_level('WARNING'):
+        amp._calc_nf(avg=True)
+    assert caplog.text == ''
 
 
 def test_gain_nf_edfa_leaves_att_in_at_zero(equipment):

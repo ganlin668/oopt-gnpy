@@ -87,11 +87,11 @@ def test_load_passive_library_reads_local_eqpt_config():
     assert set(library) == {'Mux', 'VOA', 'FIU', 'Demux'}
     assert library['Mux'].loss == {'C96': 3.0, 'L96': 3.5}
     assert library['VOA'].loss == {'C96': 5.0, 'L96': 5.5}
-    assert library['FIU'].loss == {'C96': 1.5, 'L96': 2.0}
+    assert library['FIU'].loss == {'C96': 1.0, 'L96': 1.0}
     assert library['Demux'].loss == {'C96': 3.0, 'L96': 3.5}
-    # 每个器件的 L 波段插损都应高于 C 波段
-    for params in library.values():
-        assert params.loss['L96'] > params.loss['C96']
+    # Mux / VOA / Demux 的 L 波段插损高于 C 波段（FIU 目前 C / L 相同）
+    for variety in ('Mux', 'VOA', 'Demux'):
+        assert library[variety].loss['L96'] > library[variety].loss['C96']
 
 
 @pytest.mark.parametrize('variety', ('Mux', 'VOA', 'FIU', 'Demux'))

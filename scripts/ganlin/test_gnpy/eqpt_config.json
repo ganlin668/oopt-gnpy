@@ -96,8 +96,8 @@
     {
       "type_variety": "FIU",
       "loss": {
-        "C96": 1.5,
-        "L96": 2
+        "C96": 1.0,
+        "L96": 1.0
       }
     },
     {
@@ -144,13 +144,24 @@
       },
       "mode": [
         {
-          "format": "800G ZR+ TFLN BOL",
+          "format": "800G ZR+ 150GHz TFLN BOL",
           "baud_rate": 131.3e9,
           "OSNR": 24.5,
           "bit_rate": 800e9,
           "roll_off": 0.05,
           "tx_osnr": 41,
           "tx_power": -6,
+          "min_spacing": 150e9,
+          "cost": 1
+        },
+        {
+          "format": "800G ZR+ 150GHz TFLN EOL",
+          "baud_rate": 131.3e9,
+          "OSNR": 25.0,
+          "bit_rate": 800e9,
+          "roll_off": 0.05,
+          "tx_osnr": 40,
+          "tx_power": -7,
           "min_spacing": 150e9,
           "cost": 1
         }

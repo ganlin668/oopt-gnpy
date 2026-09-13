@@ -27,6 +27,8 @@ BPLab 自建的"NF 随增益变化"的光放（纯新增，不修改 gnpy 原有
 - :class:`GainNfEdfa`：按表插值 NF 的 EDFA（无该表时行为与上游一致）
 - :class:`GainNfMultibandAmplifier`：子光放改用 :class:`GainNfEdfa` 的多波段光放
 - :func:`extract_nf_curves` / :func:`attach_nf_curves`：设备库加载时的摘除与回填
+- :func:`stub_gain_range_for_curves` / :func:`restore_gain_range`：带表的光放旁路上游
+  `variable_gain` 的 2 级 NF 拟合合法性校验（该模型对带表光放无用，但拟合不合法会拒绝加载）
 """
 
 from logging import getLogger
@@ -37,11 +39,15 @@ from numpy import array, interp
 from gnpy.core.elements import Edfa, Multiband_amplifier, _Node
 from gnpy.core.exceptions import EquipmentConfigError, ParametersError
 from gnpy.core.parameters import FrequencyBand, MultiBandParams, find_band_name
+from gnpy.core.science_utils import estimate_nf_model
 
 logger = getLogger(__name__)
 
 # 设备库 Edfa 条目里"增益 -> NF"表的字段名（dB / dB）；YANG 模型不接受该字段
 NF_CURVE_KEY = 'nf_vs_gain'
+
+# 旁路上游 2 级拟合时，候选的占位增益跨度 [dB]（相对 gain_flatmax）；按顺序取第一个可拟合的
+PLACEHOLDER_GAIN_SPANS_DB = (5, 8, 10, 12, 14, 15, 16, 17, 11, 13, 18)
 
 
 def parse_nf_curve(entries: Optional[List[Dict]]) -> Optional[Tuple[array, array]]:
@@ -109,6 +115,68 @@ def attach_nf_curves(equipment: Dict, curves: Dict[str, List[Dict]]) -> None:
         setattr(amp, NF_CURVE_KEY, curve)
 
 
+def _fitting_gain_min(gain_flatmax: float, nf_min: float, nf_max: float) -> Optional[float]:
+    """在给定 nf 端点下，找一个上游 2 级拟合能接受的 gain_min 占位值
+
+    :param gain_flatmax: 最大平坦增益 [dB]
+    :param nf_min: 最大增益处的 NF [dB]
+    :param nf_max: 最小增益处的 NF [dB]
+    :return: 可拟合的 gain_min，找不到时返回 None
+    """
+    for span in PLACEHOLDER_GAIN_SPANS_DB:
+        gain_min = gain_flatmax - span
+        try:
+            estimate_nf_model('placeholder', gain_min, gain_flatmax, nf_min, nf_max)
+            return gain_min
+        except EquipmentConfigError:
+            continue
+    return None
+
+
+def stub_gain_range_for_curves(json_data: Dict) -> Dict[str, float]:
+    """带增益-NF 表的光放：上游 2 级拟合不接受其增益窗口时，临时换成可拟合的占位窗口
+
+    上游 `variable_gain` 要求把 (gain_min, gain_flatmax, nf_min, nf_max) 拟合成 2 级 NF 模型，
+    拟合不合法（ΔP 越界）就会拒绝加载；但带 nf_vs_gain 的光放 NF 完全由表决定，并不需要该模型。
+    这里在加载前把这类条目的 gain_min 换成占位值，加载后由 :func:`restore_gain_range` 还原。
+
+    :param json_data: 原始设备库 json（就地修改）
+    :return: {型号: 配置里的 gain_min}，供加载后还原
+    """
+    saved = {}
+    for entry in json_data.get('Edfa', []):
+        if not entry.get(NF_CURVE_KEY) or entry.get('type_def', 'variable_gain') != 'variable_gain':
+            continue
+        variety = entry['type_variety']
+        try:
+            estimate_nf_model(variety, entry['gain_min'], entry['gain_flatmax'], entry['nf_min'], entry['nf_max'])
+            continue    # 原参数本来就能通过拟合校验，不做任何改动
+        except EquipmentConfigError:
+            pass
+        stub = _fitting_gain_min(entry['gain_flatmax'], entry['nf_min'], entry['nf_max'])
+        if stub is None:
+            raise EquipmentConfigError(
+                f'{variety}: with nf_min={entry["nf_min"]} and nf_max={entry["nf_max"]} the upstream two-coil '
+                f'NF model accepts no gain window, so {NF_CURVE_KEY} cannot be loaded')
+        logger.info(f'{variety}: upstream NF model rejects gain_min={entry["gain_min"]} dB, '
+                    f'loading with {stub} dB and restoring afterwards (NF comes from {NF_CURVE_KEY})')
+        saved[variety] = entry['gain_min']
+        entry['gain_min'] = stub
+    return saved
+
+
+def restore_gain_range(equipment: Dict, saved: Dict[str, float]) -> None:
+    """把 :func:`stub_gain_range_for_curves` 临时替换掉的 gain_min 还原到设备库条目上
+
+    :param equipment: 设备库字典
+    :param saved: :func:`stub_gain_range_for_curves` 的返回值
+    """
+    for variety, gain_min in saved.items():
+        amp = equipment.get('Edfa', {}).get(variety)
+        if amp is not None:
+            amp.gain_min = gain_min
+
+
 class GainNfEdfa(Edfa):
     """NF 由工作增益查表插值得到的 EDFA
 
@@ -130,6 +198,12 @@ class GainNfEdfa(Edfa):
             return super()._calc_nf(avg)
         gains, nfs = self.nf_curve
         self.att_in = 0  # 查表模型不做输入垫损
+        if self.effective_gain < gains[0]:
+            logger.warning(f'{self.uid}: gain {self.effective_gain:.2f} dB is below the {NF_CURVE_KEY} table '
+                           f'minimum {gains[0]:.2f} dB: NF is clamped to {nfs[0]:.2f} dB')
+        elif self.effective_gain > gains[-1]:
+            logger.warning(f'{self.uid}: gain {self.effective_gain:.2f} dB is above the {NF_CURVE_KEY} table '
+                           f'maximum {gains[-1]:.2f} dB: NF is clamped to {nfs[-1]:.2f} dB')
         nf_avg = interp(self.effective_gain, gains, nfs)
         return nf_avg if avg else self.interpol_nf_ripple + nf_avg
 

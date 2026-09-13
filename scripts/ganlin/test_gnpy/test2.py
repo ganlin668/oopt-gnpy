@@ -24,7 +24,7 @@ from pathlib import Path
 
 from matplotlib import rcParams
 from matplotlib.pyplot import figure, grid, legend, plot, savefig, show, title, xlabel, ylabel
-from numpy import concatenate, errstate, isfinite
+from numpy import array, concatenate, errstate, interp, isfinite
 from rich.console import Console
 from rich.table import Table
 
@@ -37,7 +37,7 @@ from gnpy.core.equipment import trx_mode_params
 from gnpy.core.info import create_arbitrary_spectral_information
 from gnpy.core.parameters import SimParams, TransceiverRole
 from gnpy.core.science_utils import RamanSolver
-from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm
+from gnpy.core.utils import db2lin, dbm2watt, freq2wavelength, lin2db, watt2dbm, wavelength2freq
 
 # matplotlib 默认字体不含中文字形，必须指定中文字体，否则图中文字显示为方框
 rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DengXian']
@@ -50,7 +50,7 @@ EQPT_CONFIG = Path(__file__).parent / 'eqpt_config.json'
 equipment = load_equipment_with_module_power(EQPT_CONFIG)
 si_default = equipment['SI']['default']
 
-trx_mode = trx_mode_params(equipment, 'Huawei', '800G ZR+ TFLN BOL')
+trx_mode = trx_mode_params(equipment, 'Huawei', '800G ZR+ 150GHz TFLN BOL')
 tx_osnr_db = trx_mode['tx_osnr']  # 发射机自身 OSNR，本案例 41 dB
 # 模块最大出光功率 tx_power，作为每波道发射功率的默认值并作为上限
 launch_dbm = launch_power_dbm(trx_mode)
@@ -62,9 +62,32 @@ SimParams.set_params({'raman_params': {'flag': True,
 
 # ---------------------------------------------------------------- 链路参数
 length_km = 80.0
-loss_coef = 0.2             # dB/km
-con_in, con_out = 0.5, 0.5  # 连接器损耗 dB
-span_loss_db = loss_coef * length_km + con_in + con_out  # 17 dB
+loss_coef = 0.275             # 1550 nm 处的衰减系数 [dB/km]，作为波长相关模型的锚点
+span_loss_db_target = 28.0
+con_in = 0.0
+con_out = span_loss_db_target-loss_coef * length_km - con_in  # 连接器损耗 dB
+span_loss_db = loss_coef * length_km + con_in + con_out  # 28.0 dB
+
+# gnpy 没有内置的解析式衰减曲线，但 FiberParams.loss_coef 支持逐波长表：
+#   {'value': [... dB/km ...], 'frequency': [... Hz ...]}，由 Fiber.loss_coef_func 在波段内线性插值。
+# 下表取自仓库自带示例（docs/json.rst 与 tests/data/fiber_slope/eqpt_config_fiber_freq.json 的
+# loss_coef_ripple），是"相对 1550 nm 的起伏"；使用时整体平移，使 1550 nm 处正好为 loss_coef。
+# 注意 FiberParams.ref_wavelength 默认就是 1550 nm（parameters.py），故单跨损耗仍按 0.275 dB/km 计。
+ATTENUATION_REF_WAVELENGTH_NM = 1550.0
+LOSS_COEF_RIPPLE = (          # (频率 [THz], 相对起伏 [dB/km])
+    (185.4923413566740, +0.0086276629224582),
+    (186.0525164113786, +0.0058291554597716),
+    (188.0131291028446, +0.0002321405343985),
+    (189.9912472647702, -0.0016335311073926),
+    (191.0765864332604, -0.0020999490178403),
+    (192.0043763676149, -0.0016335311073926),
+    (194.0175054704595, +0.0006985584448462),
+    (195.9956236323851, +0.0048963196388761),
+    (198.0087527352298, +0.0100269166538015),
+    (200.0218818380744, +0.0160903494896223),
+    (201.9649890590809, +0.0230866181463388),
+)
+
 
 spacing = trx_mode['min_spacing']  # 150 GHz
 baud_rate = trx_mode['baud_rate']  # 131.3 GBaud
@@ -83,9 +106,17 @@ si = create_arbitrary_spectral_information(
     tx_power=dbm2watt(launch_dbm), required_osnr_db_01nm=trx_mode['OSNR'])
 
 # 色散 / 有效面积 / PMD 系数取自设备库，只覆盖与具体链路相关的参数
+# 衰减系数用逐波长表：把示例起伏整体平移，使 1550 nm 处正好等于 loss_coef
+ripple_freq = array([f * 1e12 for f, _ in LOSS_COEF_RIPPLE])     # THz -> Hz
+ripple_db = array([r for _, r in LOSS_COEF_RIPPLE])              # dB/km
+ref_frequency = wavelength2freq(ATTENUATION_REF_WAVELENGTH_NM * 1e-9)
+static_db_per_km = loss_coef - interp(ref_frequency, ripple_freq, ripple_db)
+
 fiber_params = dict(equipment['Fiber']['SSMF'].__dict__)
-fiber_params.update(length=length_km, length_units='km', loss_coef=loss_coef,
-                    att_in=0, con_in=con_in, con_out=con_out, pmd_coef=3.0e-15)
+fiber_params.update(length=length_km, length_units='km', att_in=0, con_in=con_in, con_out=con_out,
+                    pmd_coef=3.0e-15,
+                    loss_coef={'value': (static_db_per_km + ripple_db).tolist(),
+                               'frequency': ripple_freq.tolist()})
 
 # ---------------------------------------------------------------- 无源器件插损（按波段）
 # Mux / VOA / FIU / Demux 只做衰减建模，插损按 C96 / L96 分别配置在设备库的 Passive 段
@@ -144,7 +175,11 @@ def build_passive(uid, variety, latitude):
 tx = Transceiver(uid='Site_A', params=trx_params,
                  metadata={'location': {'city': 'Site A', 'region': '', 'latitude': 0, 'longitude': 0}})
 mux = build_passive('Mux', 'Mux', 1)
+mux.params.loss['C96'] = 6.0
+mux.params.loss['L96'] = 6.0
 voa_tx = build_passive('VOA_Tx', 'VOA', 2)
+voa_tx.params.loss['C96'] = 3.5
+voa_tx.params.loss['L96'] = 3.5
 oa1 = build_multiband_amp('OA1', 3)
 fiu1 = build_passive('FIU1', 'FIU', 4)
 fiber = Fiber(uid='Span1', type_variety='SSMF', params=fiber_params,
@@ -152,7 +187,11 @@ fiber = Fiber(uid='Span1', type_variety='SSMF', params=fiber_params,
 fiu2 = build_passive('FIU2', 'FIU', 6)
 oa2 = build_multiband_amp('OA2', 7)
 voa_rx = build_passive('VOA_Rx', 'VOA', 8)
+voa_rx.params.loss['C96'] = 1.5
+voa_rx.params.loss['L96'] = 1.5
 demux = build_passive('Demux', 'Demux', 9)
+demux.params.loss['C96'] = 6.0
+demux.params.loss['L96'] = 6.0
 rx = Transceiver(uid='Site_B', params=trx_params,
                  metadata={'location': {'city': 'Site B', 'region': '', 'latitude': 10, 'longitude': 0}})
 
@@ -342,4 +381,31 @@ title(f'C96 + L96 共 {len(frequency)} 波：80 km SSMF + 两级 C/L 双波段�
 grid(True)
 legend()
 savefig(output_dir / 'spectrum_c96_l96.png', dpi=150)
+# show()
+
+# ---------------------------------------------------------------- 光纤衰减系数 vs 波长
+# gnpy 的 FiberParams.loss_coef 支持两种写法：
+#   标量 0.275            → 波长无关
+#   {'value': [...], 'frequency': [...]} → 逐波长表，Fiber.loss_coef_func 会在波段内插值（当前用法）
+# 这里画本链路实际生效的衰减系数，直接反映光纤衰减是否随波长变化
+loss_coef_db_per_km = fiber.loss_coef_func(frequency) * 1e3     # dB/m -> dB/km
+anchor_db_per_km = fiber.loss_coef_func(ref_frequency) * 1e3    # 锚定波长（1550 nm）处
+coef_span_db = loss_coef_db_per_km.max() - loss_coef_db_per_km.min()
+coef_kind = '（常数，与波长无关）' if coef_span_db == 0 else '（随波长变化）'
+print(f'\n光纤衰减系数（{fiber.type_variety}，{length_km:g} km）：'
+      f'{loss_coef_db_per_km.min():.4f} ~ {loss_coef_db_per_km.max():.4f} dB/km，'
+      f'波段内起伏 {coef_span_db:.3e} dB/km{coef_kind}')
+print(f'  锚定 {ATTENUATION_REF_WAVELENGTH_NM:.0f} nm 处 {anchor_db_per_km:.4f} dB/km，'
+      f'对应单跨损耗 {anchor_db_per_km * length_km + con_in + con_out:.2f} dB')
+
+figure(figsize=(11, 5))
+plot(wavelength_nm, loss_coef_db_per_km, marker='.', label='衰减系数（逐波长模型）')
+plot([ATTENUATION_REF_WAVELENGTH_NM], [anchor_db_per_km], marker='o', color='crimson',
+     label=f'{ATTENUATION_REF_WAVELENGTH_NM:.0f} nm 锚点：{anchor_db_per_km:.3f} dB/km')
+xlabel('波长 (nm)')
+ylabel('衰减系数 (dB/km)')
+title(f'C96 + L96 波段的光纤衰减系数（{fiber.type_variety}，锚定 {ATTENUATION_REF_WAVELENGTH_NM:.0f} nm）')
+grid(True)
+legend()
+savefig(output_dir / 'attenuation_coef_c96_l96.png', dpi=150)
 # show()
