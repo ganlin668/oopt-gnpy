@@ -30,6 +30,14 @@ SPACING = 150e9
 EQPT_CONFIG = Path(__file__).parents[2] / 'scripts' / 'ganlin' / 'test_gnpy' / 'eqpt_config.json'
 C96_VARIETY = 'C96_SGA_22dBm'
 L96_VARIETY = 'L96_SGA_21dBm'
+# 高功率版本（25 / 24 dBm），增益-NF 表与低功率版本各自独立
+C96_HIGH_POWER_VARIETY = 'C96_SGA_25dBm'
+L96_HIGH_POWER_VARIETY = 'L96_SGA_24dBm'
+# 带增益-NF 表的单波段型号
+CURVE_VARIETIES = (L96_VARIETY, C96_VARIETY, L96_HIGH_POWER_VARIETY, C96_HIGH_POWER_VARIETY)
+# 多波段型号（不含增益-NF 表）；低功率版由 L96_SGA_21dBm + C96_SGA_22dBm 组成
+MULTIBAND_VARIETY = 'C96L96_SGA_multiband_22/21'
+MULTIBAND_VARIETIES = (MULTIBAND_VARIETY, 'C96L96_SGA_multiband_25/24')
 # 与设备库中的占位表一致
 CURVE = [{'gain': 20.0, 'nf': 7.0}, {'gain': 25.0, 'nf': 5.5}]
 
@@ -83,11 +91,12 @@ def test_loader_attaches_nf_curve_to_edfa_entries(equipment):
     raw = load_json(EQPT_CONFIG)
     expected = {entry['type_variety']: entry[NF_CURVE_KEY]
                 for entry in raw['Edfa'] if NF_CURVE_KEY in entry}
-    assert set(expected) == {C96_VARIETY, L96_VARIETY}
+    assert set(expected) == set(CURVE_VARIETIES)
     for variety, curve in expected.items():
         assert getattr(equipment['Edfa'][variety], NF_CURVE_KEY) == curve
     # 多波段条目不含该字段，不应凭空多出属性
-    assert not hasattr(equipment['Edfa']['C96L96_SGA_multiband'], NF_CURVE_KEY)
+    for variety in MULTIBAND_VARIETIES:
+        assert not hasattr(equipment['Edfa'][variety], NF_CURVE_KEY)
 
 
 def test_loader_restores_declared_gain_range(equipment):
@@ -298,8 +307,8 @@ def test_gain_nf_multiband_amplifier_uses_each_band_own_table(equipment):
                 'operational': {'gain_target': gain_target, 'tilt_target': 0, 'out_voa': 0, 'in_voa': 0}}
 
     amp = GainNfMultibandAmplifier(
-        uid='OA1', type_variety='C96L96_SGA_multiband',
-        params=dict(equipment['Edfa']['C96L96_SGA_multiband'].__dict__),
+        uid='OA1', type_variety=MULTIBAND_VARIETY,
+        params=dict(equipment['Edfa'][MULTIBAND_VARIETY].__dict__),
         amplifiers=[band_amp(L96_VARIETY), band_amp(C96_VARIETY)])
 
     assert set(amp.amplifiers) == {'LBAND', 'CBAND'}
