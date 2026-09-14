@@ -22,8 +22,11 @@ test2.py 不依赖拓扑 JSON，直接用 gnpy 的 API 逐个搭建完整光路�
   拉曼参数（gR 峰值 0.38e-3、参考波长 1480 nm、缩放指数 2.313）取自设备库 G.652.D 条目的 raman_gain 段，
   并打印首/末波长以及 C96 / L96 各波段总功率的 SRS 转移量
 - 逐波长输出 SNR_NLI / SNR_ASE
+- 分波段输出非线性 OSNR 代价（公式参考 egn.py：-10log10(1 - OSNR_b2b/OSNR_NLI)，
+  OSNR_b2b 取模块 B2B required OSNR，OSNR_NLI 由 GN 模型的非线性噪信比折算）
 - 绘制光纤输入/输出、OA2 输出、接收端的功率谱
-- 另存两张图：光纤衰减系数 vs 波长、各位置（光纤输入/输出、OA2 输出、接收端）的逐波长 OSNR
+- 另存三张图：光纤衰减系数 vs 波长、各位置（光纤输入/输出、OA2 输出、接收端）的逐波长 OSNR、
+  各波长的非线性 OSNR 代价
 """
 
 from pathlib import Path
@@ -37,6 +40,7 @@ from rich.table import Table
 from gnpy.bplab.edfa import GainNfMultibandAmplifier
 from gnpy.bplab.fibers import loss_coef_table
 from gnpy.bplab.passives import BandAttenuator, load_passive_library
+from gnpy.bplab.qot_osnr import nli_osnr_penalty_db
 from gnpy.bplab.raman import RamanSolver, SrsFiber
 from gnpy.bplab.trx import launch_power_dbm, load_equipment_with_module_power
 from gnpy.bplab.utils import DWDM_BAND_RANGES, band_filling_center_frequencies
@@ -380,6 +384,18 @@ print_device_table('各器件单波功率（单元格式为 最差 / 平均 / �
                    [f'{band} {side}(dBm)' for band in BANDS for side in ('输入', '输出')],
                    power_wl_rows)
 
+# ---------------------------------------------------------------- 非线性 OSNR 代价
+# 公式 代价 = -10log10(1 - OSNR_b2b/OSNR_NLI) 参考 egn.py，实现见 gnpy.bplab.qot_osnr
+osnr_b2b_db = trx_mode['OSNR']                      # 模块 B2B required OSNR
+nli_penalty_db = nli_osnr_penalty_db(si, osnr_b2b_db)   # 非线性 OSNR 代价 [dB]
+
+print(f'\n非线性 OSNR 代价（GN model analytic；模块 B2B required OSNR {osnr_b2b_db:.2f} dB；'
+      f'NLI 噪信比折算到 0.1 nm 后取 1/OSNR_NLI）：')
+for band, band_slice in slices.items():
+    band_penalty = nli_penalty_db[band_slice]
+    print(f'  {band}（{band_penalty.size} 波）：最差 {fmt(band_penalty.max())} dB，'
+          f'平均 {fmt(band_penalty.mean())} dB，最好 {fmt(band_penalty.min())} dB')
+
 # ---------------------------------------------------------------- 功率谱
 # 横坐标用波长（nm）：lambda = c / f。四条曲线共用同一组频率（升序 64 波）
 wavelength_nm = freq2wavelength(srs.frequency) * 1e9
@@ -456,4 +472,18 @@ title(f'各位置的逐波长 OSNR（{FIBER_TYPE}，{length_km:g} km，含发射
 grid(True)
 legend()
 savefig(output_dir / 'osnr_c96_l96.png', dpi=150)
+# show()
+
+# ---------------------------------------------------------------- 各波长的非线性 OSNR 代价 vs 波长
+# 纵轴为上面"非线性 OSNR 代价"一节的逐波长结果：-10log10(1 - OSNR_b2b/OSNR_NLI)，
+# 其中 OSNR_b2b 为模块 B2B required OSNR，OSNR_NLI 由 GN 模型的非线性噪信比折算到 0.1 nm
+figure(figsize=(11, 5))
+plot(wavelength_nm, nli_penalty_db, marker='o', markersize=3,
+     label=f'非线性 OSNR 代价（模块 B2B required OSNR {osnr_b2b_db:.2f} dB）')
+xlabel('波长 (nm)')
+ylabel('非线性 OSNR 代价 (dB)')
+title(f'各波长的非线性 OSNR 代价（{FIBER_TYPE}，{length_km:g} km，GN model analytic）')
+grid(True)
+legend()
+savefig(output_dir / 'nli_penalty_c96_l96.png', dpi=150)
 # show()
